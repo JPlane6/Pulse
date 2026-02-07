@@ -1,5 +1,5 @@
-# ACE
-This is a medicine delivery robot called ACE.
+# Pulse
+This is a medicine delivery robot called Pulse.
 It will be able to move autonomously.
 It will use AI for active obstacle avoidance and dynamic speech.
 The main components are:
