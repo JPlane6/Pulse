@@ -1,1 +1,0 @@
-pyserial    # To connect to the serial port of the Raspberry Pi and send data to the Arduino
