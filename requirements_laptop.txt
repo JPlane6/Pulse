@@ -1,0 +1,6 @@
+flask              # Hosts the AI server (receives data from Pi)
+ultralytics        # YOLOv8 object detection
+opencv-python      # Image decoding + processing
+TTS                # Coqui text-to-speech (offline voice)
+matplotlib         # Post-run visualization (2D/3D map)
+numpy              # Math + array backbone (used everywhere)

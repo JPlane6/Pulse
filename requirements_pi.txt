@@ -1,1 +1,4 @@
-pyserial    # To connect to the serial port of the Raspberry Pi and send data to the Arduino
+requests          # Send HTTP requests to Mac Flask server
+opencv-python     # Camera capture + image processing
+pyserial          # Serial communication with Arduino
+numpy             # Array/math backbone (used by OpenCV anyway)
