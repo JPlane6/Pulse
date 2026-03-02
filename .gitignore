@@ -1,0 +1,4 @@
+venv311/
+data/output.wav
+modules/__pycache__/
+yolov8n.pt
