@@ -1,8 +1,7 @@
-# Most of this stuff needs Python 3.11 specifically
+# Recommended to use Python 3.12
 
-flask              # Hosts the AI server (receives data from Pi)
-ultralytics        # YOLOv8 object detection
-opencv-python      # Image decoding + processing
-TTS                # Coqui text-to-speech (offline voice)
-matplotlib         # Post-run visualization (2D/3D map)
-numpy              # Math + array backbone (used everywhere)
+opencv-python      # computer vision library — handles camera input and drawing bounding boxes
+torch              # machine learning framework — powers YOLOv8 inference, enables M2 GPU (MPS) acceleration
+torchvision        # torch extension — provides image processing utilities used by YOLO
+torchaudio         # torch extension — audio processing utilities, needed for future TTS integration on Pi
+ultralytics        # YOLOv8 — object detection model that identifies what's in each camera frame
