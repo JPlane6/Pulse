@@ -1,12 +1,27 @@
-from TTS.api import TTS
-import os
+# TTS Testing for my MAC, works using the built-in `say` command.
+import subprocess
+import threading
 
-# initialize once
-tts = TTS(model_name="tts_models/en/ljspeech/tacotron2-DDC")
+VOICE = "Ava"
 
-def speak(text):
-    """
-    Convert text to speech and play it immediately.
-    """
-    tts.tts_to_file(text=text, file_path="data/output.wav")  # save to file
-    os.system("afplay data/output.wav")  # Mac playback
+_speaking = False
+_lock = threading.Lock()
+
+
+def speak(text: str):
+    global _speaking
+
+    with _lock:
+        if _speaking:
+            return
+        _speaking = True
+
+    def _run():
+        global _speaking
+        try:
+            subprocess.run(["say", "-v", VOICE, text], check=True)
+        finally:
+            with _lock:
+                _speaking = False
+
+    threading.Thread(target=_run, daemon=True).start()
