@@ -1,31 +1,63 @@
 #include "AFMotor_R4.h" // Library to control DC motors on Adafruit shield
 
 // Motor objects for each motor
-AF_DCMotor motor1(1); // Right Front motor (M1)
-AF_DCMotor motor2(2); // Left Front motor (M2)
-AF_DCMotor motor3(3); // Left Back motor (M3)
-AF_DCMotor motor4(4); // Right Back motor (M4)
+AF_DCMotor motor1(4); // Back Right (M4)
+AF_DCMotor motor2(3); // Back Left (M3)
+AF_DCMotor motor3(2); // Front Right (M2)
+AF_DCMotor motor4(1); // Front Left (M1)
 
 uint8_t turnSpeed = 180;  // Global speed used for turns (0-255)
+
+// State machine states
+enum State { IDLE, RAMPING_UP, RUNNING, RAMPING_DOWN };
+State state = IDLE;
+
+// Tracking variables for non-blocking timing
+uint8_t targetSpeed = 0;
+uint8_t currentRampSpeed = 0;
+unsigned long stateStartTime = 0;
+unsigned long runDuration = 0;
+unsigned long lastRampTime = 0;
+bool locked = false; // Locked after STOP, unlocked by GO
 
 // Function prototypes
 void moveAll(uint8_t direction, uint16_t seconds, uint8_t speed); // Move all motors
 void turn(char side, uint16_t seconds); // Turn left or right
 
+void setAllSpeed(uint8_t spd) {
+  motor1.setSpeed(spd);
+  motor2.setSpeed(spd);
+  motor3.setSpeed(spd);
+  motor4.setSpeed(spd);
+}
+
+void stopAll() {
+  motor1.run(BRAKE); // Stop motor1
+  motor2.run(BRAKE); // Stop motor2
+  motor3.run(BRAKE); // Stop motor3
+  motor4.run(BRAKE); // Stop motor4
+  state = IDLE;
+  Serial.println("STOPPED");
+}
+
+void releaseAll() {
+  motor1.run(RELEASE); // Cut motor power
+  motor2.run(RELEASE); // Cut motor power
+  motor3.run(RELEASE); // Cut motor power
+  motor4.run(RELEASE); // Cut motor power
+  state = IDLE;
+  Serial.println("READY");
+}
+
 void setup() {
   Serial.begin(9600); // Start serial communication with Pi
 
-  motor1.setSpeed(0);
   motor1.run(BRAKE);  // Stop motor1
-
-  motor2.setSpeed(0);
   motor2.run(BRAKE);  // Stop motor2
-
-  motor3.setSpeed(0);
   motor3.run(BRAKE);  // Stop motor3
-
-  motor4.setSpeed(0);
   motor4.run(BRAKE);  // Stop motor4
+
+  Serial.println("READY");
 }
 
 void loop() {
@@ -33,29 +65,83 @@ void loop() {
     String cmd = Serial.readStringUntil('\n');  // Read full command line
     cmd.trim(); // Remove extra spaces/newlines
 
-    // MOVE command: expects "MOVE F 200 1" or "MOVE B 150 2"
-    if (cmd.startsWith("MOVE")) {
-      char dir = cmd.charAt(5); // 'F' = forward, 'B' = backward
-
-      int space1 = cmd.indexOf(' ', 6); // First space after direction
-      int space2 = cmd.indexOf(' ', space1 + 1);  // Second space after speed
-
-      uint8_t speed = cmd.substring(space1 + 1, space2).toInt();  // Convert speed to number
-      uint16_t sec = cmd.substring(space2 + 1).toInt(); // Convert duration to number
-
-      if (dir == 'F') {
-        moveAll(FORWARD, sec, speed); // Move forward
-      }
-      else if (dir == 'B') {
-        moveAll(BACKWARD, sec, speed); // Move backward
-      }
+    // STOP works always, even mid-move
+    if (cmd == "STOP") {
+      stopAll();
+      locked = true; // Lock robot until GO is received
+      Serial.println("LOCKED");
+      return;
     }
 
-    // TURN command: expects "TURN L 1" or "TURN R 2"
-    else if (cmd.startsWith("TURN")) {
-      char side = cmd.charAt(5);  // 'L' = left, 'R' = right
-      uint16_t sec = cmd.substring(7).toInt();  // Convert duration to number
-      turn(side, sec);  // Execute turn
+    // GO unlocks the robot after a STOP
+    if (cmd == "GO") {
+      locked = false;
+      Serial.println("UNLOCKED");
+      return;
+    }
+
+    // MOVE command: expects "MOVE F 200 1" or "MOVE B 150 2"
+    if (state == IDLE && !locked) {
+      if (cmd.startsWith("MOVE")) {
+        char dir = cmd.charAt(5); // 'F' = forward, 'B' = backward
+
+        int space1 = cmd.indexOf(' ', 6); // First space after direction
+        int space2 = cmd.indexOf(' ', space1 + 1);  // Second space after speed
+
+        uint8_t speed = cmd.substring(space1 + 1, space2).toInt();  // Convert speed to number
+        uint16_t sec = cmd.substring(space2 + 1).toInt(); // Convert duration to number
+
+        if (dir == 'F') {
+          moveAll(FORWARD, sec, speed); // Move forward
+        } else if (dir == 'B') {
+          moveAll(BACKWARD, sec, speed); // Move backward
+        }
+      }
+
+      // TURN command: expects "TURN L 1" or "TURN R 2"
+      else if (cmd.startsWith("TURN")) {
+        char side = cmd.charAt(5);  // 'L' = left, 'R' = right
+        uint16_t sec = cmd.substring(7).toInt();  // Convert duration to number
+        turn(side, sec);  // Execute turn
+      }
+    }
+  }
+
+  // Non-blocking state machine - replaces all delay() calls
+  unsigned long now = millis();
+
+  if (state == RAMPING_UP) {
+    if (now - lastRampTime >= 10) { // Every 10ms, same as your original delay(10)
+      lastRampTime = now;
+      currentRampSpeed++;
+      setAllSpeed(currentRampSpeed);
+
+      if (currentRampSpeed >= targetSpeed) { // Max speed safety
+        setAllSpeed(targetSpeed);
+        stateStartTime = millis();
+        state = RUNNING;
+      }
+    }
+  }
+
+  else if (state == RUNNING) {
+    if (now - stateStartTime >= runDuration) { // Same as your delay(seconds * 1000)
+      currentRampSpeed = targetSpeed;
+      lastRampTime = now;
+      state = RAMPING_DOWN;
+    }
+  }
+
+  else if (state == RAMPING_DOWN) {
+    if (now - lastRampTime >= 10) { // Every 10ms, same as your original delay(10)
+      lastRampTime = now;
+      if (currentRampSpeed > 0) {
+        currentRampSpeed--;
+        setAllSpeed(currentRampSpeed);
+      } else {
+        releaseAll(); // Cut motor power
+        Serial.println("DONE");
+      }
     }
   }
 }
@@ -67,98 +153,40 @@ void moveAll(uint8_t direction, uint16_t seconds, uint8_t speed) {
   motor3.run(direction); // Set left back
   motor4.run(direction); // Set right back
 
-  for (uint8_t i = 0; i < speed; i++) { // Gradually ramp up speed
-    motor1.setSpeed(i); 
-    motor2.setSpeed(i);
-    motor3.setSpeed(i); 
-    motor4.setSpeed(i);
-    delay(10);  // Small delay for smooth ramp
-  }
-
-  if (speed == 255) { // Max speed safety
-    motor1.setSpeed(255); 
-    motor2.setSpeed(255);
-    motor3.setSpeed(255); 
-    motor4.setSpeed(255);
-  }
-
-  delay(seconds * 1000);  // Run motors for specified amount of time
-
-  for (uint8_t i = speed; i > 0; i--) { // Ramp down speed
-    motor1.setSpeed(i); 
-    motor2.setSpeed(i);
-    motor3.setSpeed(i); 
-    motor4.setSpeed(i);
-    delay(10);
-  }
-
-  motor1.setSpeed(0); 
-  motor2.setSpeed(0); // Stop motors
-  motor3.setSpeed(0); 
-  motor4.setSpeed(0);
-
-  motor1.run(RELEASE); 
-  motor2.run(RELEASE); // Cut motor power
-  motor3.run(RELEASE); 
-  motor4.run(RELEASE);
-  delay(10); // Short pause
+  targetSpeed = speed;
+  runDuration = (unsigned long)seconds * 1000;
+  currentRampSpeed = 0;
+  setAllSpeed(0);
+  lastRampTime = millis();
+  state = RAMPING_UP;
+  Serial.println("MOVING");
 }
 
 // Turn robot left or right
 void turn(char side, uint16_t seconds) {
   if (side == 'L') {  // Left turn: right side backward, left side forward
-    motor1.run(BACKWARD); 
+    motor1.run(BACKWARD);
     motor4.run(BACKWARD); // Right side motors
-    motor2.run(FORWARD); 
+    motor2.run(FORWARD);
     motor3.run(FORWARD); // Left side motors
-  } 
-  else if (side == 'R') { // Right turn: right side forward, left side backward
-    motor1.run(FORWARD); 
+  } else if (side == 'R') { // Right turn: right side forward, left side backward
+    motor1.run(FORWARD);
     motor4.run(FORWARD); // Right side motors
-    motor2.run(BACKWARD); 
+    motor2.run(BACKWARD);
     motor3.run(BACKWARD); // Left side motors
-  } 
-  else {  // Invalid input, stop motors
-    motor1.run(RELEASE); 
-    motor2.run(RELEASE); 
-    motor3.run(RELEASE); 
+  } else {  // Invalid input, stop motors
+    motor1.run(RELEASE);
+    motor2.run(RELEASE);
+    motor3.run(RELEASE);
     motor4.run(RELEASE);
     return;
   }
 
-  for (uint8_t i = 0; i < turnSpeed; i++) { // Ramp up turn speed
-    motor1.setSpeed(i); 
-    motor2.setSpeed(i);
-    motor3.setSpeed(i); 
-    motor4.setSpeed(i);
-    delay(10);
-  }
-
-  if (turnSpeed == 255) { // Max speed safety
-    motor1.setSpeed(255); 
-    motor2.setSpeed(255);
-    motor3.setSpeed(255); 
-    motor4.setSpeed(255);
-  }
-
-  delay(seconds * 1000);  // Turn duration
-
-  for (uint8_t i = turnSpeed; i > 0; i--) { // Ramp down speed
-    motor1.setSpeed(i); 
-    motor2.setSpeed(i);
-    motor3.setSpeed(i); 
-    motor4.setSpeed(i);
-    delay(10);
-  }
-
-  motor1.setSpeed(0); 
-  motor2.setSpeed(0); // Stop motors
-  motor3.setSpeed(0); 
-  motor4.setSpeed(0);
-
-  motor1.run(RELEASE); 
-  motor2.run(RELEASE); // Cut motor power
-  motor3.run(RELEASE); 
-  motor4.run(RELEASE);
-  delay(10);  // Short pause after turn
+  targetSpeed = turnSpeed;
+  runDuration = (unsigned long)seconds * 1000;
+  currentRampSpeed = 0;
+  setAllSpeed(0);
+  lastRampTime = millis();
+  state = RAMPING_UP;
+  Serial.println("TURNING");
 }
