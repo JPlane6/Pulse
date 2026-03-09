@@ -2,10 +2,14 @@ import serial
 import time
 
 # Connect to Arduino
-arduino = serial.Serial('/dev/ttyACM0', 9600, timeout=1) #Change to whereever the Arduino is connected
-time.sleep(2)  # Wait for Arduino to boot
-
-print(arduino.readline().decode().strip())
+try:
+    arduino = serial.Serial('/dev/ttyACM0', 9600, timeout=1) #Change to whereever the Arduino is connected
+    time.sleep(2)  # Wait for Arduino to boot
+    print(arduino.readline().decode().strip())
+except serial.SerialException:
+    print("Error: Could not connect to Arduino on /dev/ttyACM0")
+    print("Check that the Arduino is plugged in and the port is correct")
+    exit()
 
 def wait_for(response, timeout=10):
     start = time.time()
