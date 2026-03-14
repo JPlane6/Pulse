@@ -53,5 +53,7 @@ if __name__ == "__main__":
         move('B', 200, 1)  # Backward 1 second
         turn('L', 1)       # Left turn 1 second
         turn('R', 1)       # Right turn 1 second
+    except KeyboardInterrupt:
+        print("\nInterrupted by user")
     finally:
         arduino.close()
