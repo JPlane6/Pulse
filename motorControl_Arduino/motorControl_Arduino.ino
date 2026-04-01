@@ -3,8 +3,8 @@
 // Motor objects for each motor
 AF_DCMotor motor1(4); // Back Right (M4)
 AF_DCMotor motor2(3); // Back Left (M3)
-AF_DCMotor motor3(2); // Front Right (M2)
-AF_DCMotor motor4(1); // Front Left (M1)
+AF_DCMotor motor3(2); // Front Left (M2)
+AF_DCMotor motor4(1); // Front Right (M1)
 
 uint8_t turnSpeed = 180;  // Global speed used for turns (0-255)
 
