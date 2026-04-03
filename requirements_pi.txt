@@ -1,0 +1,11 @@
+pyserial          # Serial communication with Arduino
+matplotlib        # Live polar radar display
+flask             # Web Browser Display of Basic 'Radar' using LiDAR
+
+# Use Python 3.12 for optimal usage
+# ydlidar is NOT pip installable — install manually:
+# git clone https://github.com/YDLIDAR/YDLidar-SDK.git
+# cd YDLidar-SDK
+# pip install .
+
+# threading, time, math, sys — Python standard library, no install needed
