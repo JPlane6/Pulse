@@ -1,5 +1,4 @@
 #Prototype 1 - Pulse YDLiDAR
-
 import ydlidar
 import time
 
@@ -7,9 +6,19 @@ import time
 def m_to_in(meters):
     return meters * 39.3701
 
+def get_distance(scan):
+    """Returns the closest valid distance in inches from a scan, or None if nothing detected."""
+    closest = None
+    for point in scan.points:
+        dist_inches = m_to_in(point.range)
+        if 0.1 < dist_inches <= 5.0:
+            if closest is None or dist_inches < closest:
+                closest = dist_inches
+    return closest
+
 def main():
     laser = ydlidar.CYdLidar()
-    
+
     # --- Hardware Setup ---
     laser.setlidaropt(ydlidar.LidarPropSerialPort, "/dev/ttyUSB0")
     laser.setlidaropt(ydlidar.LidarPropSerialBaudrate, 128000)
@@ -20,7 +29,6 @@ def main():
     if not laser.initialize():
         print("Failed to initialize LiDAR")
         return
-
     if not laser.turnOn():
         print("Failed to start motor")
         return
@@ -29,19 +37,12 @@ def main():
     print("Monitoring distance... Press Ctrl+C to stop.")
 
     try:
-        while True: # The infinite loop
+        while True:
             if laser.doProcessSimple(scan):
-                # We want to check every point in a 360-degree scan
-                for point in scan.points:
-                    dist_inches = m_to_in(point.range)
-                    
-                    # Ignore 0.0 (error/no return) and check if within 5 inches
-                    if 0.1 < dist_inches <= 5.0:
-                        print(f"WALL DETECTED! Distance: {dist_inches:.2f} in at Angle: {point.angle:.2f} rad")
-                        # Add a tiny sleep or break if you don't want 1000 prints per second
-                        break 
-            
-            time.sleep(0.05) # Small delay to prevent CPU overload
+                distance = get_distance(scan)
+                if distance is not None:
+                    print(f"WALL DETECTED! Closest Distance: {distance:.2f} in")
+            time.sleep(0.05)
 
     except KeyboardInterrupt:
         print("Stopping...")

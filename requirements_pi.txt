@@ -1,11 +1,16 @@
-pyserial          # Serial communication with Arduino
-matplotlib        # Live polar radar display
-flask             # Web Browser Display of Basic 'Radar' using LiDAR
+# Pulse — Raspberry Pi Requirements
+# Run: pip install -r requirements_pi.txt
 
-# Use Python 3.12 for optimal usage
+pyserial      # Serial communication with Arduino
+matplotlib    # Live polar radar display (monitor mode)
+flask         # Web radar server (SSH-only, open in laptop browser)
+
 # ydlidar is NOT pip installable — install manually:
 # git clone https://github.com/YDLIDAR/YDLidar-SDK.git
 # cd YDLidar-SDK
 # pip install .
+#
+# swig is required BEFORE building ydlidar:
+# sudo apt-get install swig -y
 
-# threading, time, math, sys — Python standard library, no install needed
+# threading, time, math, sys, os — Python standard library, no install needed
