@@ -4,6 +4,12 @@
 pyserial      # Serial communication with Arduino
 matplotlib    # Live polar radar display (monitor mode)
 flask         # Web radar server (SSH-only, open in laptop browser)
+RPLCD         # Running the LCD (Library)
+smbus2
+
+# i2c-tools: (not pip installable)
+# install with this command:
+# sudo apt-get install i2c-toools -y
 
 # ydlidar is NOT pip installable — install manually:
 # git clone https://github.com/YDLIDAR/YDLidar-SDK.git
