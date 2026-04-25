@@ -6,14 +6,16 @@ lcd = CharLCD('PCF8574', 0x27, cols=20, rows=4)
 def hello():
     try:
         lcd.clear()
+        lcd.cursor_pos = (0, 0)
+        lcd.write_string("HELLO,")
         lcd.cursor_pos = (1, 0)
-        lcd.write_string("HELLO AYUSH SHARMA!")
+        lcd.write_string("DAIVIK SHAH, ")
         lcd.cursor_pos = (2, 0)
-        lcd.write_string("This is PULSE!")
-        # Move to the third line for a status update
+        lcd.write_string("AND")
         lcd.cursor_pos = (3, 0)
-        lcd.write_string("oh & daivik i guess")
-        
+        lcd.write_string("AYUSH SHARMA!")
+        time.sleep(5)
+        lcd.clear()
 
     except Exception as e:
         print(f"Could not connect to LCD: {e}")

@@ -7,37 +7,31 @@ import lcd_hello
 LIDAR_PORT = "/dev/ttyUSB0"
 
 
-def get_left_right_distances_cm(scan, side_window_deg=30):
-    left_min = 90 - side_window_deg
-    left_max = 90 + side_window_deg
-    right_min = 270 - side_window_deg
-    right_max = 270 + side_window_deg
-
+def get_left_right_distances_cm(scan, side_window_deg=20):
     left_closest = None
     right_closest = None
 
     for point in scan.points:
         angle_deg = math.degrees(point.angle)
+        if angle_deg < 0:
+            angle_deg += 360
+
         dist_m = point.range
         if dist_m <= 0.10:
             continue
 
         dist_cm = dist_m * 100.0
+        adjusted_angle = 150
+        offsetR = 20
 
-        if left_min <= angle_deg <= left_max:
+        if (adjusted_angle - side_window_deg) <= angle_deg <= (adjusted_angle + side_window_deg):
             if left_closest is None or dist_cm < left_closest:
                 left_closest = dist_cm
 
-        if right_min <= angle_deg <= right_max:
+        if (350 - side_window_deg) <= angle_deg <= (350 + side_window_deg):
             if right_closest is None or dist_cm < right_closest:
                 right_closest = dist_cm
-
-    if left_closest is None:
-        left_closest = 999.0
-    if right_closest is None:
-        right_closest = 999.0
-
-    return left_closest, right_closest
+    return left_closest or 999.0, right_closest or 999.0
 
 
 def main():
@@ -47,10 +41,7 @@ def main():
         return
 
     lcd.clear()
-    lcd_hello.hello()
-    # lcd.write_string("PULSE SYSTEM".ljust(20))
-    # lcd.cursor_pos = (1, 0)
-    # lcd.write_string("INITIALIZING...".ljust(20))
+    # lcd_hello.hello()
 
     laser = ydlidar.CYdLidar()
     laser.setlidaropt(ydlidar.LidarPropSerialPort, LIDAR_PORT)
@@ -58,10 +49,9 @@ def main():
     laser.setlidaropt(ydlidar.LidarPropLidarType, ydlidar.TYPE_TRIANGLE)
     laser.setlidaropt(ydlidar.LidarPropDeviceType, ydlidar.YDLIDAR_TYPE_SERIAL)
     laser.setlidaropt(ydlidar.LidarPropSingleChannel, True)
-    laser.setlidaropt(ydlidar.LidarPropSampleRate, 3)
-    laser.setlidaropt(ydlidar.LidarPropScanFrequency, 5.0)
+    laser.setlidaropt(ydlidar.LidarPropSampleRate, 5)
+    laser.setlidaropt(ydlidar.LidarPropScanFrequency, 12.0)
 
-    time.sleep(2)
 
     if not laser.initialize():
         lcd.clear()

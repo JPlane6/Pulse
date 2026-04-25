@@ -17,10 +17,6 @@ def _connect_arduino():
 
 arduino = _connect_arduino()
 
-# ============================================================
-# ARDUINO COMMANDS
-# ============================================================
-
 def wait_for(response, timeout=10):
     start = time.time()
     while time.time() - start < timeout:
@@ -53,10 +49,6 @@ def go():
     print("Sent: GO")
     wait_for("UNLOCKED", timeout=3)
 
-# ============================================================
-# MOVEMENT WITH LIDAR
-# ============================================================
-
 def moveUntilThreshold(direction, speed, threshold_cm, laser):
     """Move until obstacle within threshold_cm — then stop and return."""
     cmd = f"MOVE {direction} {speed} 9999\n"
@@ -75,10 +67,6 @@ def moveUntilThreshold(direction, speed, threshold_cm, laser):
                     print(f"Obstacle at {dist:.1f}cm — stopped.")
                     return dist, scan
         time.sleep(0.05)
-
-# ============================================================
-# MAIN
-# ============================================================
 
 if __name__ == "__main__":
     laser = init_lidar()
