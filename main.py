@@ -2,6 +2,7 @@ import time
 import math
 import ydlidar
 from RPLCD.i2c import CharLCD
+import lcd_hello
 
 LIDAR_PORT = "/dev/ttyUSB0"
 
@@ -46,9 +47,10 @@ def main():
         return
 
     lcd.clear()
-    lcd.write_string("PULSE SYSTEM".ljust(20))
-    lcd.cursor_pos = (1, 0)
-    lcd.write_string("INITIALIZING...".ljust(20))
+    lcd_hello.hello()
+    # lcd.write_string("PULSE SYSTEM".ljust(20))
+    # lcd.cursor_pos = (1, 0)
+    # lcd.write_string("INITIALIZING...".ljust(20))
 
     laser = ydlidar.CYdLidar()
     laser.setlidaropt(ydlidar.LidarPropSerialPort, LIDAR_PORT)
