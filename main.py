@@ -1,93 +1,101 @@
 import time
-import sys
+import math
 import ydlidar
-from driver import RobotDriver
 from RPLCD.i2c import CharLCD
 
-# --- HARDWARE MAPPING ---
-# Arduino is usually ACM0, LiDAR is usually USB0
-# If LiDAR doesn't appear, try changing "/dev/ttyUSB0" to "/dev/ttyACM1"
-LIDAR_PORT = "/dev/ttyUSB0" 
-ARDUINO_PORT = "/dev/ttyACM0"
+LIDAR_PORT = "/dev/ttyUSB0"
 
-# --- INITIALIZE HARDWARE ---
-print("Step 1: Connecting to Muscles (Arduino)...")
-robot = RobotDriver(port=ARDUINO_PORT)
 
-print("Step 2: Connecting to Eyes (LiDAR)...")
-laser = ydlidar.CYdLidar()
-laser.setlidaropt(ydlidar.LidarPropSerialPort, LIDAR_PORT)
-laser.setlidaropt(ydlidar.LidarPropSerialBaudrate, 128000)
-laser.setlidaropt(ydlidar.LidarPropLidarType, ydlidar.TYPE_TRIANGLE)
-laser.setlidaropt(ydlidar.LidarPropDeviceType, ydlidar.YDLIDAR_TYPE_SERIAL)
-laser.setlidaropt(ydlidar.LidarPropSingleChannel, True)
+def get_left_right_distances_cm(scan, side_window_deg=30):
+    left_min = 90 - side_window_deg
+    left_max = 90 + side_window_deg
+    right_min = 270 - side_window_deg
+    right_max = 270 + side_window_deg
 
-# Power-saving / Stability settings for Pi 5
-laser.setlidaropt(ydlidar.LidarPropSampleRate, 3) 
-laser.setlidaropt(ydlidar.LidarPropScanFrequency, 5.0) 
+    left_closest = None
+    right_closest = None
 
-print("Step 3: Connecting to Screen (LCD)...")
-try:
-    lcd = CharLCD('PCF8574', 0x27, cols=20, rows=4)
-except:
-    print("LCD not found, skipping display.")
-    lcd = None
+    for point in scan.points:
+        angle_deg = math.degrees(point.angle)
+        dist_m = point.range
+        if dist_m <= 0.10:
+            continue
+
+        dist_cm = dist_m * 100.0
+
+        if left_min <= angle_deg <= left_max:
+            if left_closest is None or dist_cm < left_closest:
+                left_closest = dist_cm
+
+        if right_min <= angle_deg <= right_max:
+            if right_closest is None or dist_cm < right_closest:
+                right_closest = dist_cm
+
+    if left_closest is None:
+        left_closest = 999.0
+    if right_closest is None:
+        right_closest = 999.0
+
+    return left_closest, right_closest
+
 
 def main():
-    if lcd:
-        lcd.clear()
-        lcd.write_string("PULSE SYSTEM\nINITIALIZING...")
-    
-    # Wait for power to stabilize
-    time.sleep(2) 
-
-    if not laser.initialize():
-        print(f"ERROR: Cannot find LiDAR on {LIDAR_PORT}. check cables!")
+    try:
+        lcd = CharLCD("PCF8574", 0x27, cols=20, rows=4)
+    except Exception:
         return
 
-    laser.turnOn()
-    print("System Online. Starting Loop.")
-    
+    lcd.clear()
+    lcd.write_string("PULSE SYSTEM".ljust(20))
+    lcd.cursor_pos = (1, 0)
+    lcd.write_string("INITIALIZING...".ljust(20))
+
+    laser = ydlidar.CYdLidar()
+    laser.setlidaropt(ydlidar.LidarPropSerialPort, LIDAR_PORT)
+    laser.setlidaropt(ydlidar.LidarPropSerialBaudrate, 128000)
+    laser.setlidaropt(ydlidar.LidarPropLidarType, ydlidar.TYPE_TRIANGLE)
+    laser.setlidaropt(ydlidar.LidarPropDeviceType, ydlidar.YDLIDAR_TYPE_SERIAL)
+    laser.setlidaropt(ydlidar.LidarPropSingleChannel, True)
+    laser.setlidaropt(ydlidar.LidarPropSampleRate, 3)
+    laser.setlidaropt(ydlidar.LidarPropScanFrequency, 5.0)
+
+    time.sleep(2)
+
+    if not laser.initialize():
+        lcd.clear()
+        lcd.write_string("LIDAR INIT ERROR".ljust(20))
+        lcd.cursor_pos = (1, 0)
+        lcd.write_string(LIDAR_PORT.ljust(20)[:20])
+        return
+
+    if not laser.turnOn():
+        lcd.clear()
+        lcd.write_string("LIDAR MOTOR ERROR".ljust(20))
+        return
+
     scan = ydlidar.LaserScan()
 
     try:
         while True:
             if laser.doProcessSimple(scan):
-                # Filter points in a 60-degree cone in front (330 to 30 deg)
-                # Angle in Radians: > 5.75 or < 0.52
-                front_points = [p.range for p in scan.points if (p.angle > 5.75 or p.angle < 0.52) and p.range > 0.1]
-                
-                dist = min(front_points) * 100 if front_points else 999
-                
-                if lcd:
-                    lcd.cursor_pos = (2, 0)
-                    lcd.write_string(f"Dist: {dist:>5.1f} cm   ")
-
-                # --- DECISION LOGIC ---
-                if dist < 45:
-                    if lcd:
-                        lcd.cursor_pos = (3, 0)
-                        lcd.write_string("STATUS: TURN LEFT  ")
-                    robot.stop()
-                    time.sleep(0.2)
-                    robot.turn('L', 1) # Command: TURN L 1
-                else:
-                    if lcd:
-                        lcd.cursor_pos = (3, 0)
-                        lcd.write_string("STATUS: MOVING FWD ")
-                    robot.move_forward(speed=170, duration=0.3)
-            
+                left_cm, right_cm = get_left_right_distances_cm(scan)
+                lcd.cursor_pos = (0, 0)
+                lcd.write_string("LIDAR LEFT/RIGHT".ljust(20))
+                lcd.cursor_pos = (1, 0)
+                lcd.write_string(f"LEFT : {left_cm:6.1f}cm".ljust(20))
+                lcd.cursor_pos = (2, 0)
+                lcd.write_string(f"RIGHT: {right_cm:6.1f}cm".ljust(20))
+                lcd.cursor_pos = (3, 0)
+                lcd.write_string("RUNNING".ljust(20))
             time.sleep(0.05)
-
     except KeyboardInterrupt:
-        print("\nShutting down...")
+        pass
     finally:
         laser.turnOff()
         laser.disconnecting()
-        robot.stop()
-        if lcd:
-            lcd.clear()
-            lcd.write_string("SYSTEM IDLE")
+        lcd.clear()
+        lcd.write_string("SYSTEM IDLE".ljust(20))
+
 
 if __name__ == "__main__":
     main()
