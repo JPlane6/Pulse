@@ -3,6 +3,7 @@ import math
 import ydlidar
 from RPLCD.i2c import CharLCD
 import lcd_hello
+import motorControl_Pi as motors
 
 LIDAR_PORT = "/dev/ttyUSB0"
 
@@ -41,7 +42,7 @@ def main():
         return
 
     lcd.clear()
-    # lcd_hello.hello()
+    lcd_hello.hello()
 
     laser = ydlidar.CYdLidar()
     laser.setlidaropt(ydlidar.LidarPropSerialPort, LIDAR_PORT)
@@ -68,6 +69,10 @@ def main():
     scan = ydlidar.LaserScan()
 
     try:
+
+        motors.go()
+        motors.moveUntilThreshold('F', 200, 15, laser)
+
         while True:
             if laser.doProcessSimple(scan):
                 left_cm, right_cm = get_left_right_distances_cm(scan)
@@ -80,6 +85,7 @@ def main():
                 lcd.cursor_pos = (3, 0)
                 lcd.write_string("RUNNING".ljust(20))
             time.sleep(0.05)
+
     except KeyboardInterrupt:
         pass
     finally:
