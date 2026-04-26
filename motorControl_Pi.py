@@ -49,7 +49,7 @@ def go():
     print("Sent: GO")
     wait_for("UNLOCKED", timeout=3)
 
-def moveUntilThreshold(direction, speed, threshold_cm, laser):
+def moveUntilThreshold(direction, speed = 200, threshold_cm, laser):
     """Move until obstacle within threshold_cm — then stop and return."""
     cmd = f"MOVE {direction} {speed} 9999\n"
     arduino.write(cmd.encode('utf-8'))

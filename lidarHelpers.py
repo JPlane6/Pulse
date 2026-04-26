@@ -33,6 +33,10 @@ def get_front_distance(scan, cone_deg=30):
                     closest = dist_cm
     return closest
 
+def is_obstcle_ahead(scan, threshold_cm=30):
+    front_dist = get_front_distance(scan)
+    return front_dist is not None and front_dist < threshold_cm
+
 def get_all_distance(scan):
     """Returns closest valid distance in cm from full 360 scan, or None."""
     closest = None
