@@ -8,34 +8,6 @@ import lidarHelpers as lidarHelpers
 
 LIDAR_PORT = "/dev/ttyUSB0"
 
-
-def get_left_right_distances_cm(scan, side_window_deg=20):
-    left_closest = None
-    right_closest = None
-
-    for point in scan.points:
-        angle_deg = math.degrees(point.angle)
-        if angle_deg < 0:
-            angle_deg += 360
-
-        dist_m = point.range
-        if dist_m <= 0.10:
-            continue
-
-        dist_cm = dist_m * 100.0
-        adjusted_angle = 150
-        offsetR = 20
-
-        if (adjusted_angle - side_window_deg) <= angle_deg <= (adjusted_angle + side_window_deg):
-            if left_closest is None or dist_cm < left_closest:
-                left_closest = dist_cm
-
-        if (350 - side_window_deg) <= angle_deg <= (350 + side_window_deg):
-            if right_closest is None or dist_cm < right_closest:
-                right_closest = dist_cm
-    return left_closest or 999.0, right_closest or 999.0
-
-
 def main():
     try:
         lcd = CharLCD("PCF8574", 0x27, cols=20, rows=4)
@@ -79,7 +51,7 @@ def main():
                 motors.moveUntilThreshold("FORWARD", 200, 30, laser)
 
             if laser.doProcessSimple(scan):
-                left_cm, right_cm = get_left_right_distances_cm(scan)
+                left_cm, right_cm = lidarHelpers.get_left_right_distances_cm(scan)
                 lcd.cursor_pos = (0, 0)
                 lcd.write_string("LIDAR LEFT/RIGHT".ljust(20))
                 lcd.cursor_pos = (1, 0)
