@@ -1,22 +1,35 @@
 # Pulse — Raspberry Pi Requirements
-# Run: pip install -r requirements_pi.txt
+# Run: pip install -r requirements_pi.txt --break-system-packages
 
-pyserial      # Serial communication with Arduino
-matplotlib    # Live polar radar display (monitor mode)
-flask         # Web radar server (SSH-only, open in laptop browser)
-RPLCD         # Running the LCD (Library)
-smbus2
+pyserial        # serial communication with Arduino
+RPLCD           # LCD display control
+smbus2          # I2C communication for LCD
+opencv-python   # camera input and frame processing
+vosk            # offline speech to text
+sounddevice     # microphone audio recording for Vosk
 
-# i2c-tools: (not pip installable)
-# install with this command:
-# sudo apt-get install i2c-toools -y
+# --- NOT pip installable ---
 
-# ydlidar is NOT pip installable — install manually:
-# git clone https://github.com/YDLIDAR/YDLidar-SDK.git
-# cd YDLidar-SDK
-# pip install .
-#
-# swig is required BEFORE building ydlidar:
+# espeak (text to speech on Pi):
+# sudo apt-get install espeak -y
+
+# unzip (for extracting vosk model):
+# sudo apt-get install unzip -y
+
+# i2c-tools (for LCD I2C):
+# sudo apt-get install i2c-tools -y
+
+# ydlidar SDK (LiDAR driver):
 # sudo apt-get install swig -y
+# git clone https://github.com/YDLIDAR/YDLidar-SDK.git
+# cd YDLidar-SDK && pip install .
 
-# threading, time, math, sys, os — Python standard library, no install needed
+# Ollama (local AI for visual triage):
+# curl -fsSL https://ollama.com/install.sh | sh
+# ollama pull llava
+
+# Vosk model (offline speech recognition):
+# download vosk-model-small-en-us-0.15.zip from https://alphacephei.com/vosk/models
+# unzip into project root
+
+# threading, time, math, json, os, base64 — Python standard library, no install needed

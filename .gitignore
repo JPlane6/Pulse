@@ -1,5 +1,19 @@
+# OS
 .DS_Store
-venv312
+
+# Python
+venv312/
 __pycache__/
+*.pyc
+*.pyo
+
+# Codex
 .codex
-yolo26x.pt
+
+# Large model files — do not commit these
+vosk-model-small-en-us-0.15/
+*.zip
+*.pt
+*.pth
+
+# Ollama models are stored system-wide, not in project

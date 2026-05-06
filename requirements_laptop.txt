@@ -1,7 +1,24 @@
-# Recommended to use Python 3.12
+# Pulse — Laptop (Mac) Requirements
+# Run: pip install -r requirements_laptop.txt
 
-opencv-python      # computer vision library — handles camera input and drawing bounding boxes
-torch              # machine learning framework — powers YOLOv8 inference, enables M2 GPU (MPS) acceleration
-torchvision        # torch extension — provides image processing utilities used by YOLO
-torchaudio         # torch extension — audio processing utilities, needed for future TTS integration on Pi
-ultralytics        # YOLOv8 — object detection model that identifies what's in each camera frame
+opencv-python   # camera input and drawing bounding boxes
+torch           # ML framework — powers YOLOv8, enables M2 GPU (MPS) acceleration
+torchvision     # torch extension — image processing utilities
+torchaudio      # torch extension — audio utilities
+ultralytics     # YOLOv8 — object detection model
+vosk            # offline speech to text (for local testing)
+sounddevice     # microphone audio recording for Vosk
+
+# --- NOT pip installable ---
+
+# Ollama (local AI for visual triage — run on laptop for better speed):
+# curl -fsSL https://ollama.com/install.sh | sh
+# ollama pull llava
+# ollama pull tinyllama
+
+# Vosk model (offline speech recognition):
+# download vosk-model-small-en-us-0.15.zip from https://alphacephei.com/vosk/models
+# unzip into project root
+
+# Note: tts.py uses macOS built-in `say` command — no install needed on Mac
+# Note: threading, time, math, json, os, base64 — Python standard library, no install needed
