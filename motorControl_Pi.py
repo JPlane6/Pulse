@@ -49,7 +49,7 @@ def go():
     print("Sent: GO")
     wait_for("UNLOCKED", timeout=3)
 
-def moveUntilThreshold(direction, speed = 200, threshold_cm, laser):
+def moveUntilThreshold(direction, threshold_cm, laser, speed=200):
     """Move until obstacle within threshold_cm — then stop and return."""
     cmd = f"MOVE {direction} {speed} 9999\n"
     arduino.write(cmd.encode('utf-8'))
@@ -64,6 +64,7 @@ def moveUntilThreshold(direction, speed = 200, threshold_cm, laser):
                 print(f"Forward distance: {dist:.1f}cm")
                 if dist <= threshold_cm:
                     stop()
+                    go()  # unlock immediately after stopping
                     print(f"Obstacle at {dist:.1f}cm — stopped.")
                     return dist, scan
         time.sleep(0.05)
@@ -71,11 +72,7 @@ def moveUntilThreshold(direction, speed = 200, threshold_cm, laser):
 if __name__ == "__main__":
     laser = init_lidar()
     try:
-        # move('F', 200, 1)
-        # move('B', 200, 1)
-        # turn('L', 1)
-        # turn('R', 1)
-        moveUntilThreshold('F', 200, 15, laser)  # stop at 10cm
+        moveUntilThreshold('F', 15, laser)
     except KeyboardInterrupt:
         print("\nInterrupted by user")
     finally:

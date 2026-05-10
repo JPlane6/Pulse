@@ -19,8 +19,16 @@ sounddevice     # microphone audio recording for Vosk
 # i2c-tools (for LCD I2C):
 # sudo apt-get install i2c-tools -y
 
-# ydlidar SDK (LiDAR driver):
+# python dev headers (required for ydlidar SDK build):
+# sudo apt-get install python3-dev -y
+
+# cmake (required for ydlidar SDK build):
+# sudo apt-get install cmake -y
+
+# swig (required for ydlidar SDK Python bindings):
 # sudo apt-get install swig -y
+
+# ydlidar SDK (LiDAR driver):
 # git clone https://github.com/YDLIDAR/YDLidar-SDK.git
 # cd YDLidar-SDK && pip install .
 

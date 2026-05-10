@@ -2,7 +2,7 @@
 .DS_Store
 
 # Python
-venv312/
+venv/
 __pycache__/
 *.pyc
 *.pyo
