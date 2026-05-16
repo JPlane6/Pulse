@@ -8,10 +8,8 @@ import lidarHelpers
 
 # --- Constants ---
 LIDAR_PORT              = "/dev/ttyUSB0"
-OBSTACLE_THRESHOLD_CM   = 30
-WALL_NUDGE_THRESHOLD_CM = 20
-WALL_NUDGE_DURATION_SEC = 0.3
-DOOR_GAP_THRESHOLD_CM   = 80
+OBSTACLE_THRESHOLD_CM   = 20
+OPENING_INCREASE_CM     = 50  # Increase in side distance to detect opening/doorway
 
 
 # ------------------------------------------------------------------ #
@@ -67,8 +65,12 @@ def main():
 
     scan = ydlidar.LaserScan()
 
+    # Track previous distances to detect openings
+    prev_left_cm = None
+    prev_right_cm = None
+
     # ---------------------------------------------------------------- #
-    #  Main loop                                                        #
+    #  Main loop — simplified gallery navigation                       #
     # ---------------------------------------------------------------- #
     try:
         while True:
@@ -78,76 +80,87 @@ def main():
 
             left_cm, right_cm = lidarHelpers.get_left_right_distances_cm(scan)
             front_cm = lidarHelpers.get_front_distance(scan)
-            obs_dir  = lidarHelpers.get_obstacle_direction(scan, threshold_cm=OBSTACLE_THRESHOLD_CM)
 
             # -------------------------------------------------------- #
-            #  Priority 1 — obstacle ahead: stop and wait             #
+            #  Priority 1 — obstacle in front: stop and wait          #
             # -------------------------------------------------------- #
             if lidarHelpers.is_obstacle_ahead(scan, threshold_cm=OBSTACLE_THRESHOLD_CM):
                 motors.stop()
-                motors.go()
-                print(f"[main] OBSTACLE F — stopped | F:{front_cm} L:{left_cm:.1f} R:{right_cm:.1f}")
+                update_lcd(lcd, left_cm, right_cm, front_cm, "OBSTACLE - STOPPED")
+                print(f"[main] OBSTACLE ahead — stopped | F:{front_cm} L:{left_cm:.1f} R:{right_cm:.1f}")
 
+                # Wait until obstacle clears
                 while True:
-                    obs_dir = lidarHelpers.get_obstacle_direction(scan, threshold_cm=OBSTACLE_THRESHOLD_CM)
-                    dir_label = obs_dir if obs_dir else "F"
-                    update_lcd(lcd, left_cm, right_cm, front_cm, f"OBSTACLE {dir_label}")
                     if laser.doProcessSimple(scan):
                         left_cm, right_cm = lidarHelpers.get_left_right_distances_cm(scan)
                         front_cm = lidarHelpers.get_front_distance(scan)
+                        update_lcd(lcd, left_cm, right_cm, front_cm, "OBSTACLE - STOPPED")
+                        
                         if not lidarHelpers.is_obstacle_ahead(scan, threshold_cm=OBSTACLE_THRESHOLD_CM):
                             print("[main] Obstacle cleared — resuming.")
                             update_lcd(lcd, left_cm, right_cm, front_cm, "RESUMING...")
-                            time.sleep(1)
+                            time.sleep(0.5)
                             break
                     time.sleep(0.05)
 
             # -------------------------------------------------------- #
-            #  Priority 2 — doorway detected: large gap on one side   #
+            #  Priority 2 — opening detected on left: turn left       #
             # -------------------------------------------------------- #
-            elif (abs(left_cm - right_cm) > DOOR_GAP_THRESHOLD_CM
-                  and left_cm < 999.0 and right_cm < 999.0):
-                turn_dir  = lidarHelpers.get_turn_direction(scan)
-                turn_word = "RIGHT" if turn_dir == "R" else "LEFT"
-
-                update_lcd(lcd, left_cm, right_cm, front_cm, f"DOOR {turn_word}")
-                print(f"[main] Doorway — turning {turn_word} | F:{front_cm} L:{left_cm:.1f} R:{right_cm:.1f}")
-
+            elif (prev_left_cm is not None and 
+                  left_cm < 999.0 and 
+                  left_cm - prev_left_cm > OPENING_INCREASE_CM):
+                
                 motors.stop()
-                motors.go()
-
-                while True:
-                    motors.turn(turn_dir, 1)
+                print(f"[main] Opening on LEFT detected — turning | F:{front_cm} L:{left_cm:.1f} R:{right_cm:.1f}")
+                
+                # Turn left while continuously updating LCD
+                turn_start = time.time()
+                while time.time() - turn_start < 2:
+                    motors.turn('L', 0.1)
                     if laser.doProcessSimple(scan):
                         left_cm, right_cm = lidarHelpers.get_left_right_distances_cm(scan)
                         front_cm = lidarHelpers.get_front_distance(scan)
-                        update_lcd(lcd, left_cm, right_cm, front_cm, f"DOOR {turn_word}")
-                        if not lidarHelpers.is_obstacle_ahead(scan, threshold_cm=OBSTACLE_THRESHOLD_CM):
-                            print("[main] Aligned into doorway — resuming.")
-                            break
-
+                        update_lcd(lcd, left_cm, right_cm, front_cm, "TURNING LEFT")
+                    time.sleep(0.05)
+                
                 motors.stop()
-                motors.go()
+                time.sleep(0.3)
 
             # -------------------------------------------------------- #
-            #  Priority 3 — wall drift (small correction)             #
+            #  Priority 3 — opening detected on right: turn right     #
             # -------------------------------------------------------- #
-            elif (abs(left_cm - right_cm) > WALL_NUDGE_THRESHOLD_CM
-                  and left_cm < 999.0 and right_cm < 999.0):
-                nudge_dir  = lidarHelpers.get_turn_direction(scan)
-                nudge_word = "RIGHT" if nudge_dir == "R" else "LEFT"
-
-                update_lcd(lcd, left_cm, right_cm, front_cm, f"NUDGE {nudge_word}")
-                print(f"[main] Wall drift — nudging {nudge_word} | F:{front_cm} L:{left_cm:.1f} R:{right_cm:.1f}")
-                motors.turn(nudge_dir, WALL_NUDGE_DURATION_SEC)
+            elif (prev_right_cm is not None and 
+                  right_cm < 999.0 and 
+                  right_cm - prev_right_cm > OPENING_INCREASE_CM):
+                
+                motors.stop()
+                print(f"[main] Opening on RIGHT detected — turning | F:{front_cm} L:{left_cm:.1f} R:{right_cm:.1f}")
+                
+                # Turn right while continuously updating LCD
+                turn_start = time.time()
+                while time.time() - turn_start < 2:
+                    motors.turn('R', 0.1)
+                    if laser.doProcessSimple(scan):
+                        left_cm, right_cm = lidarHelpers.get_left_right_distances_cm(scan)
+                        front_cm = lidarHelpers.get_front_distance(scan)
+                        update_lcd(lcd, left_cm, right_cm, front_cm, "TURNING RIGHT")
+                    time.sleep(0.05)
+                
+                motors.stop()
+                time.sleep(0.3)
 
             # -------------------------------------------------------- #
-            #  Priority 4 — all clear                                  #
+            #  Priority 4 — go straight                                #
             # -------------------------------------------------------- #
             else:
-                update_lcd(lcd, left_cm, right_cm, front_cm, "RUNNING")
+                update_lcd(lcd, left_cm, right_cm, front_cm, "GOING STRAIGHT")
                 motors.go()
-                motors.moveUntilThreshold("F", OBSTACLE_THRESHOLD_CM, laser, 200)
+
+            # Update previous distances for next iteration
+            if left_cm < 999.0:
+                prev_left_cm = left_cm
+            if right_cm < 999.0:
+                prev_right_cm = right_cm
 
             time.sleep(0.05)
 

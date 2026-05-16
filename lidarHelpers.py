@@ -3,10 +3,10 @@ import math
 
 LIDAR_PORT   = "/dev/ttyUSB0"
 FRONT_ANGLE  = 63    # confirmed from front wall scan
-RIGHT_ANGLE  = 332   # swapped — was LEFT
-LEFT_ANGLE   = 145   # swapped — was RIGHT
-FRONT_CONE   = 20
-SIDE_CONE    = 20
+RIGHT_ANGLE  = 150   # swapped — was LEFT
+LEFT_ANGLE   = 330   # swapped — was RIGHT
+FRONT_CONE   = 10
+SIDE_CONE    = 10
 
 def m_to_cm(meters):
     return meters * 100.0
