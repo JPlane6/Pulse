@@ -7,8 +7,8 @@ __pycache__/
 *.pyc
 *.pyo
 
-# Codex
-.codex
+
+
 
 # Large model files — do not commit these
 vosk-model-small-en-us-0.15/
@@ -16,4 +16,7 @@ vosk-model-small-en-us-0.15/
 *.pt
 *.pth
 
+#log files
+
+modules/logs/
 # Ollama models are stored system-wide, not in project
