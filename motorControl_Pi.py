@@ -3,7 +3,7 @@ import time
 import ydlidar
 from lidarHelpers import init_lidar, get_front_distance
 
-ARDUINO_PORT = "/dev/ttyACM0"
+ARDUINO_PORT = "/dev/ttyACM0"  # Update as needed
 
 def _connect_arduino():
     try:

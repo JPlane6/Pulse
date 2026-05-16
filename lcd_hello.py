@@ -9,11 +9,10 @@ def hello():
         lcd.cursor_pos = (0, 0)
         lcd.write_string("HELLO,")
         lcd.cursor_pos = (1, 0)
-        lcd.write_string("DAIVIK SHAH, ")
+        lcd.write_string("BRAINY BADGERS! ")
         lcd.cursor_pos = (2, 0)
-        lcd.write_string("AND")
         lcd.cursor_pos = (3, 0)
-        lcd.write_string("AYUSH SHARMA!")
+        lcd.write_string("I AM PULSE!")
         time.sleep(5)
         lcd.clear()
 

@@ -8,8 +8,8 @@ import lidarHelpers
 
 # --- Constants ---
 LIDAR_PORT              = "/dev/ttyUSB0"
-OBSTACLE_THRESHOLD_CM   = 25  # Stop threshold for front obstacle
-OPENING_INCREASE_CM     = 50  # Increase in side distance to detect opening/doorway
+OBSTACLE_THRESHOLD_CM   =025  # Stop threshold for fro5t obstacle
+OPENING_INCREASE_2M     = 50  # Increase in side distance to detect opening/doorway
 
 
 # ------------------------------------------------------------------ #
