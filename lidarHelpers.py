@@ -8,10 +8,13 @@ LIDAR_PORT   = "/dev/ttyUSB0"
 FRONT_ANGLE  = 63    # Front detection center (degrees)
 RIGHT_ANGLE  = 150   # Right detection center (degrees)
 LEFT_ANGLE   = 340   # Left detection center (degrees)
-FRONT_CONE   = 5     # Front detection range: 63±5° = 58-68°
+FRONT_CONE   = 10    # Front detection range: 63±10° = 53-73°
 SIDE_CONE    = 5     # Side detection range: L=335-345°, R=145-155°
-MIN_DISTANCE_CM = 10.0   # Ignore anything closer than 10cm
-MAX_DISTANCE_CM = 300.0  # Ignore anything farther than 300cm
+
+# Zone-specific minimum distances
+MIN_FRONT_DISTANCE_CM = 35.0  # Front: Filter robot chassis
+MIN_SIDE_DISTANCE_CM = 20.0   # Left/Right: Detect corridor walls (typically 30-40cm)
+MAX_DISTANCE_CM = 300.0       # Ignore anything farther than 300cm
 
 def m_to_cm(meters):
     return meters * 100.0
@@ -48,10 +51,14 @@ def _get_angular_distance(angle_deg, center):
 # ═══════════════════════════════════════════════════════════════════
 #  SINGLE-PASS ZONE DETECTION (prevents cross-zone contamination)
 # ═══════════════════════════════════════════════════════════════════
-def get_all_distances(scan):
+def get_all_distances(scan, debug=False):
     """
     Process LiDAR scan in ONE PASS to prevent zone bleeding.
     Each point is assigned to the zone whose center it's closest to.
+
+    Args:
+        scan: LiDAR scan object
+        debug: If True, prints angle information for detected obstacles
 
     Returns: (front_cm, left_cm, right_cm)
     - front_cm: Closest distance in front zone, or None
@@ -61,6 +68,11 @@ def get_all_distances(scan):
     front_closest = None
     left_closest = None
     right_closest = None
+    
+    # Debug info
+    front_angle_at_closest = None
+    left_angle_at_closest = None
+    right_angle_at_closest = None
 
     for point in scan.points:
         angle_deg = math.degrees(point.angle)
@@ -68,12 +80,23 @@ def get_all_distances(scan):
             angle_deg += 360
 
         dist_cm = m_to_cm(point.range)
-        if dist_cm <= MIN_DISTANCE_CM or dist_cm > MAX_DISTANCE_CM:
+        
+        # Skip if too far
+        if dist_cm > MAX_DISTANCE_CM:
             continue
 
+        # Check which zone(s) this point could belong to
         in_front = _angle_in_cone(angle_deg, FRONT_ANGLE, FRONT_CONE)
         in_left  = _angle_in_cone(angle_deg, LEFT_ANGLE,  SIDE_CONE)
         in_right = _angle_in_cone(angle_deg, RIGHT_ANGLE, SIDE_CONE)
+        
+        # Apply zone-specific minimum distance filters
+        if in_front and dist_cm <= MIN_FRONT_DISTANCE_CM:
+            in_front = False
+        if in_left and dist_cm <= MIN_SIDE_DISTANCE_CM:
+            in_left = False
+        if in_right and dist_cm <= MIN_SIDE_DISTANCE_CM:
+            in_right = False
 
         zone_matches = sum([in_front, in_left, in_right])
 
@@ -83,12 +106,15 @@ def get_all_distances(scan):
             if in_front:
                 if front_closest is None or dist_cm < front_closest:
                     front_closest = dist_cm
+                    front_angle_at_closest = angle_deg
             elif in_left:
                 if left_closest is None or dist_cm < left_closest:
                     left_closest = dist_cm
+                    left_angle_at_closest = angle_deg
             elif in_right:
                 if right_closest is None or dist_cm < right_closest:
                     right_closest = dist_cm
+                    right_angle_at_closest = angle_deg
         else:
             distances = []
             if in_front:
@@ -103,12 +129,25 @@ def get_all_distances(scan):
             if closest_zone == 'F':
                 if front_closest is None or dist_cm < front_closest:
                     front_closest = dist_cm
+                    front_angle_at_closest = angle_deg
             elif closest_zone == 'L':
                 if left_closest is None or dist_cm < left_closest:
                     left_closest = dist_cm
+                    left_angle_at_closest = angle_deg
             elif closest_zone == 'R':
                 if right_closest is None or dist_cm < right_closest:
                     right_closest = dist_cm
+                    right_angle_at_closest = angle_deg
+    
+    # Debug output
+    if debug and (front_closest is not None or left_closest or right_closest):
+        print(f"[LIDAR-DEBUG] Detection angles:")
+        if front_closest is not None:
+            print(f"  Front: {front_closest:.1f}cm at angle {front_angle_at_closest:.1f}° (zone: {FRONT_ANGLE}±{FRONT_CONE}°)")
+        if left_closest and left_closest < 999.0:
+            print(f"  Left:  {left_closest:.1f}cm at angle {left_angle_at_closest:.1f}° (zone: {LEFT_ANGLE}±{SIDE_CONE}°)")
+        if right_closest and right_closest < 999.0:
+            print(f"  Right: {right_closest:.1f}cm at angle {right_angle_at_closest:.1f}° (zone: {RIGHT_ANGLE}±{SIDE_CONE}°)")
 
     return front_closest, left_closest or 999.0, right_closest or 999.0
 
