@@ -9,13 +9,15 @@ from datetime import datetime
 
 # --- Constants ---
 LIDAR_PORT              = "/dev/ttyUSB0"
-OBSTACLE_THRESHOLD_CM   = 60  # Increased to 60cm for reliable stopping (robot moves fast)
+OBSTACLE_THRESHOLD_CM   = 35  # Increased to 60cm for reliable stopping (robot moves fast)
 OPENING_INCREASE_CM     = 20
 
 # --- Turn-and-enter constants (measure these physically) ---
-TURN_DURATION_SEC       = 1.0    # PLACEHOLDER — time in seconds for a 90° turn
-ENTER_SPEED             = 200    # same speed as forward motion
-ENTER_DURATION_SEC      = 2      # PLACEHOLDER — how long to drive into the room
+TURN_DURATION_SEC       = 2   # PLACEHOLDER — time in seconds for a 90° turn
+ENTER_SPEED             = 170    # same speed as forward motion
+ENTER_DURATION_SEC      = 1     # PLACEHOLDER — how long to drive into the room
+ENTER_ROOM_THRESHOLD_CM = 45  # Minimum increase to consider it an opening (must be > OBSTACLE_THRESHOLD_CM)
+
 
 
 def update_lcd(lcd, left_cm, right_cm, front_cm, status_line):
@@ -45,7 +47,7 @@ def log_distances(front_cm, left_cm, right_cm):
     print(f"[{ts}] F:{front_str}cm L:{left_cm:.1f}cm R:{right_cm:.1f}cm")
 
 
-def move_forward_until_obstacle(laser, lcd=None, threshold_cm=25, speed=200):
+def move_forward_until_obstacle(laser, lcd=None, threshold_cm=25, speed=ENTER_SPEED):
     motors.go()
     cmd = f"MOVE F {speed} 9999\n"
     motors.arduino.write(cmd.encode('utf-8'))
@@ -76,10 +78,11 @@ def move_forward_until_obstacle(laser, lcd=None, threshold_cm=25, speed=200):
         time.sleep(0.05)
 
 
-def enter_room(side, lcd=None):
+def enter_room(side, laser, lcd=None):
     """
     Stop, turn 90 degrees toward the opening, then drive forward into the room.
     side: 'L' or 'R'
+    laser: LiDAR object for distance measurement
     """
     print(f"[enter_room] Turning {side} into opening...")
     if lcd:
@@ -94,7 +97,7 @@ def enter_room(side, lcd=None):
         lcd.cursor_pos = (3, 0)
         lcd.write_string("ENTERING ROOM...".ljust(20)[:20])
 
-    motors.move('F', ENTER_SPEED, ENTER_DURATION_SEC)
+    motors.moveUntilThreshold('F', ENTER_ROOM_THRESHOLD_CM, laser, ENTER_SPEED)
 
     print(f"[enter_room] Entered room.")
 
@@ -173,7 +176,7 @@ def main():
                             if front_check is None or front_check >= OBSTACLE_THRESHOLD_CM:
                                 print("[main] Obstacle cleared — resuming.")
                                 motors.go()
-                                cmd = "MOVE F 200 9999\n"
+                                cmd = f"MOVE F {ENTER_SPEED} 9999\n"
                                 motors.arduino.write(cmd.encode('utf-8'))
                                 motors.wait_for("MOVING", timeout=3)
                                 motor_state = "MOVING"
@@ -207,7 +210,7 @@ def main():
                             if front_check is not None and front_check >= OBSTACLE_THRESHOLD_CM:
                                 print("[main] Obstacle cleared — resuming.")
                                 motors.go()
-                                cmd = "MOVE F 200 9999\n"
+                                cmd = f"MOVE F {ENTER_SPEED} 9999\n"
                                 motors.arduino.write(cmd.encode('utf-8'))
                                 motors.wait_for("MOVING", timeout=3)
                                 motor_state = "MOVING"
@@ -236,7 +239,7 @@ def main():
                 update_lcd(lcd, left_cm, right_cm, front_cm, "OPENING LEFT!")
                 time.sleep(0.3)
 
-                enter_room('L', lcd)
+                enter_room('L', laser, lcd)
 
                 prev_left_cm = left_cm
                 prev_right_cm = right_cm
@@ -255,7 +258,7 @@ def main():
                 update_lcd(lcd, left_cm, right_cm, front_cm, "OPENING RIGHT!")
                 time.sleep(0.3)
 
-                enter_room('R', lcd)
+                enter_room('R', laser, lcd)
 
                 prev_right_cm = right_cm
                 prev_left_cm = left_cm
@@ -267,7 +270,7 @@ def main():
                 update_lcd(lcd, left_cm, right_cm, front_cm, "GOING STRAIGHT")
                 if motor_state != "MOVING":
                     motors.go()
-                    cmd = "MOVE F 200 9999\n"
+                    cmd = f"MOVE F {ENTER_SPEED} 9999\n"
                     motors.arduino.write(cmd.encode('utf-8'))
                     print("[main] Starting forward motion")
                     motors.wait_for("MOVING", timeout=3)

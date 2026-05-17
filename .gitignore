@@ -7,7 +7,9 @@ __pycache__/
 *.pyc
 *.pyo
 
-
+# TTS Models
+en_US-amy-medium.onnx
+en_US-amy-medium.onnx.json
 
 
 # Large model files — do not commit these
