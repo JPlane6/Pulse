@@ -165,15 +165,15 @@ void moveAll(uint8_t direction, uint16_t seconds, uint8_t speed) {
 // Turn robot left or right
 void turn(char side, uint16_t seconds) {
   if (side == 'L') {  // Left turn: right side backward, left side forward
-    motor1.run(BACKWARD);
-    motor4.run(BACKWARD); // Right side motors
-    motor2.run(FORWARD);
-    motor3.run(FORWARD); // Left side motors
-  } else if (side == 'R') { // Right turn: right side forward, left side backward
     motor1.run(FORWARD);
     motor4.run(FORWARD); // Right side motors
     motor2.run(BACKWARD);
     motor3.run(BACKWARD); // Left side motors
+  } else if (side == 'R') { // Right turn: right side forward, left side backward
+    motor1.run(BACKWARD);
+    motor4.run(BACKWARD); // Right side motors
+    motor2.run(FORWARD);
+    motor3.run(FORWARD); // Left side motors
   } else {  // Invalid input, stop motors
     motor1.run(RELEASE);
     motor2.run(RELEASE);
