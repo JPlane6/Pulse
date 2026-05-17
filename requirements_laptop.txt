@@ -2,23 +2,24 @@
 # Run: pip install -r requirements_laptop.txt
 
 opencv-python   # camera input and drawing bounding boxes
-torch           # ML framework — powers YOLOv8, enables M2 GPU (MPS) acceleration
-torchvision     # torch extension — image processing utilities
-torchaudio      # torch extension — audio utilities
-ultralytics     # YOLOv8 — object detection model
-vosk            # offline speech to text (for local testing)
-sounddevice     # microphone audio recording for Vosk
+torch           # ML framework — powers YOLOv8, M2 GPU acceleration
+torchvision     # torch image processing utilities
+torchaudio      # torch audio utilities
+ultralytics     # YOLOv8 object detection
+openai-whisper  # speech to text — runs on M2 GPU
+sounddevice     # microphone audio (for local testing only)
+scipy           # save audio as WAV for Whisper
+flask           # web server — receives requests from Pi
+requests        # send requests to Ollama
 
 # --- NOT pip installable ---
 
-# Ollama (local AI for visual triage — run on laptop for better speed):
+# Ollama (local AI — phi3:mini for questions, llava for vision):
 # curl -fsSL https://ollama.com/install.sh | sh
+# ollama pull phi3:mini
 # ollama pull llava
-# ollama pull tinyllama
 
-# Vosk model (offline speech recognition):
-# download vosk-model-small-en-us-0.15.zip from https://alphacephei.com/vosk/models
-# unzip into project root
+# ffmpeg (required by Whisper):
+# brew install ffmpeg
 
-# Note: tts.py uses macOS built-in `say` command — no install needed on Mac
-# Note: threading, time, math, json, os, base64 — Python standard library, no install needed
+# threading, time, json, os, tempfile — Python standard library

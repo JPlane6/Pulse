@@ -5,16 +5,16 @@ pyserial        # serial communication with Arduino
 RPLCD           # LCD display control
 smbus2          # I2C communication for LCD
 opencv-python   # camera input and frame processing
-vosk            # offline speech to text
-sounddevice     # microphone audio recording for Vosk
+sounddevice     # microphone audio recording
+scipy           # save audio as WAV file for Whisper
+requests        # send audio/data to laptop server
 
 # --- NOT pip installable ---
 
-# espeak (text to speech on Pi):
-# sudo apt-get install espeak -y
-
-# unzip (for extracting vosk model):
-# sudo apt-get install unzip -y
+# piper (text to speech):
+# pip install piper-tts --break-system-packages
+# download voice: wget https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/amy/medium/en_US-amy-medium.onnx
+# download config: wget https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/amy/medium/en_US-amy-medium.onnx.json
 
 # i2c-tools (for LCD I2C):
 # sudo apt-get install i2c-tools -y
@@ -32,12 +32,4 @@ sounddevice     # microphone audio recording for Vosk
 # git clone https://github.com/YDLIDAR/YDLidar-SDK.git
 # cd YDLidar-SDK && pip install .
 
-# Ollama (local AI for visual triage):
-# curl -fsSL https://ollama.com/install.sh | sh
-# ollama pull llava
-
-# Vosk model (offline speech recognition):
-# download vosk-model-small-en-us-0.15.zip from https://alphacephei.com/vosk/models
-# unzip into project root
-
-# threading, time, math, json, os, base64 — Python standard library, no install needed
+# threading, time, json, os, subprocess, tempfile — Python standard library
