@@ -8,16 +8,15 @@ from lidarHelpers import get_stable_distances
 from datetime import datetime
 
 # --- Constants ---
-LIDAR_PORT              = "/dev/ttyUSB1"
-OBSTACLE_THRESHOLD_CM   = 35  # Increased to 60cm for reliable stopping (robot moves fast)
-OPENING_INCREASE_CM     = 20
+LIDAR_PORT              = "/dev/lidar"
+OBSTACLE_THRESHOLD_CM   = 50   # CHANGED: was 35, more braking distance at higher voltage
+OPENING_INCREASE_CM     = 12   # CHANGED: was 20, catch openings earlier
 
 # --- Turn-and-enter constants (measure these physically) ---
-TURN_DURATION_SEC       = 2   # PLACEHOLDER — time in seconds for a 90° turn
-ENTER_SPEED             = 170    # same speed as forward motion
-ENTER_DURATION_SEC      = 1     # PLACEHOLDER — how long to drive into the room
-ENTER_ROOM_THRESHOLD_CM = 45  # Minimum increase to consider it an opening (must be > OBSTACLE_THRESHOLD_CM)
-
+TURN_DURATION_SEC       = 1    # time in seconds for a 90° turn
+ENTER_SPEED             = 155  # CHANGED: was 170, slowed down so LiDAR can catch openings
+ENTER_DURATION_SEC      = 1    # how long to drive into the room
+ENTER_ROOM_THRESHOLD_CM = 45   # minimum increase to consider it an opening
 
 
 def update_lcd(lcd, left_cm, right_cm, front_cm, status_line):
@@ -41,6 +40,7 @@ def update_lcd_fast(lcd, left_cm, right_cm, front_cm, status_line):
     lcd.cursor_pos = (3, 0)
     lcd.write_string(status_line.ljust(20)[:20])
 
+
 def log_distances(front_cm, left_cm, right_cm):
     ts = datetime.now().strftime("%H:%M:%S")
     front_str = f"{front_cm:.1f}" if front_cm is not None else "---"
@@ -60,7 +60,6 @@ def move_forward_until_obstacle(laser, lcd=None, threshold_cm=25, speed=ENTER_SP
     while True:
         front_cm, left_cm, right_cm = get_stable_distances(laser, scan)
         log_distances(front_cm, left_cm, right_cm)
-
 
         if lcd:
             update_lcd(lcd, left_cm, right_cm, front_cm, "MOVING FWD...")
@@ -141,7 +140,7 @@ def main():
     last_turn_time = 0
     TURN_COOLDOWN = 3.0
     motor_state = "IDLE"
-    
+
     print("=" * 60)
     print("ROBOT NAVIGATION - READY")
     print(f"  - Front obstacle detection: 35-300cm (stops at {OBSTACLE_THRESHOLD_CM}cm)")
@@ -155,14 +154,14 @@ def main():
             # Fast single-scan check for immediate obstacle detection
             if laser.doProcessSimple(scan):
                 front_cm_fast, _, _ = lidarHelpers.get_all_distances(scan, debug=False)  # Debug disabled - working perfectly
-                
+
                 # CRITICAL: Check for obstacle IMMEDIATELY (no averaging delay)
                 if front_cm_fast is not None and front_cm_fast < OBSTACLE_THRESHOLD_CM:
                     if motor_state != "STOPPED":
                         motors.stop()
                         motor_state = "STOPPED"
                         print(f"[main] EMERGENCY STOP - Obstacle at {front_cm_fast:.1f}cm")
-                    
+
                     # Get stable readings for display
                     front_cm, left_cm, right_cm = get_stable_distances(laser, scan, num_scans=3)
                     log_distances(front_cm, left_cm, right_cm)
@@ -172,7 +171,7 @@ def main():
                     while True:
                         if laser.doProcessSimple(scan):
                             front_check, _, _ = lidarHelpers.get_all_distances(scan)
-                            
+
                             if front_check is None or front_check >= OBSTACLE_THRESHOLD_CM:
                                 print("[main] Obstacle cleared — resuming.")
                                 motors.go()
@@ -182,21 +181,21 @@ def main():
                                 motor_state = "MOVING"
                                 prev_front_cm = None  # Reset tracking
                                 break
-                            
-                            # Update display less frequently in stopped state
+
+                            # Update display while waiting
                             if laser.doProcessSimple(scan):
                                 front_cm, left_cm, right_cm = get_stable_distances(laser, scan, num_scans=2)
                                 log_distances(front_cm, left_cm, right_cm)
                                 update_lcd(lcd, left_cm, right_cm, front_cm, "OBSTACLE - STOPPED")
                     continue  # Restart main loop after clearing obstacle
-                
+
                 # FAILSAFE: If front reading suddenly disappears, obstacle likely very close - STOP!
                 elif front_cm_fast is None and prev_front_cm is not None and prev_front_cm < OBSTACLE_THRESHOLD_CM:
                     if motor_state != "STOPPED":
                         motors.stop()
                         motor_state = "STOPPED"
                         print(f"[main] EMERGENCY STOP - Obstacle too close (lost detection at {prev_front_cm:.1f}cm)")
-                    
+
                     # Get stable readings for display
                     front_cm, left_cm, right_cm = get_stable_distances(laser, scan, num_scans=2)
                     log_distances(front_cm, left_cm, right_cm)
@@ -206,7 +205,7 @@ def main():
                     while True:
                         if laser.doProcessSimple(scan):
                             front_check, _, _ = lidarHelpers.get_all_distances(scan)
-                            
+
                             if front_check is not None and front_check >= OBSTACLE_THRESHOLD_CM:
                                 print("[main] Obstacle cleared — resuming.")
                                 motors.go()
@@ -216,10 +215,10 @@ def main():
                                 motor_state = "MOVING"
                                 prev_front_cm = None
                                 break
-                            
+
                             time.sleep(0.1)
                     continue
-                
+
                 # Update previous front for next iteration
                 prev_front_cm = front_cm_fast
 
@@ -229,9 +228,9 @@ def main():
 
             # PRIORITY 2: LEFT OPENING
             if (prev_left_cm is not None and
-                  left_cm < 999.0 and
-                  left_cm - prev_left_cm > OPENING_INCREASE_CM and
-                  time.time() - last_turn_time > TURN_COOLDOWN):
+                    left_cm < 999.0 and
+                    left_cm - prev_left_cm > OPENING_INCREASE_CM and
+                    time.time() - last_turn_time > TURN_COOLDOWN):
 
                 print(f"[OPENING] LEFT room detected! Distance increased {left_cm - prev_left_cm:.0f}cm ({prev_left_cm:.0f}→{left_cm:.0f}cm)")
                 print(f"[main] Opening on LEFT — stopping and entering | L:{left_cm:.1f} prev:{prev_left_cm:.1f}")
@@ -248,9 +247,9 @@ def main():
 
             # PRIORITY 3: RIGHT OPENING
             elif (prev_right_cm is not None and
-                  right_cm < 999.0 and
-                  right_cm - prev_right_cm > OPENING_INCREASE_CM and
-                  time.time() - last_turn_time > TURN_COOLDOWN):
+                    right_cm < 999.0 and
+                    right_cm - prev_right_cm > OPENING_INCREASE_CM and
+                    time.time() - last_turn_time > TURN_COOLDOWN):
 
                 print(f"[OPENING] RIGHT room detected! Distance increased {right_cm - prev_right_cm:.0f}cm ({prev_right_cm:.0f}→{right_cm:.0f}cm)")
                 print(f"[main] Opening on RIGHT — stopping and entering | R:{right_cm:.1f} prev:{prev_right_cm:.1f}")

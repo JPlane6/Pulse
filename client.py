@@ -13,7 +13,7 @@ SERVER_URL    = "http://192.168.0.156:5000"
 ROOM          = "001"
 PATIENT_NAME  = "Ayush"
 MAX_QUESTIONS = 6
-SAMPLERATE    = 16000
+SAMPLERATE    = 48000
 AUDIO_DEVICE  = 0
 PIPER_MODEL   = "/home/ayushs0604/Pulse/en_US-amy-medium.onnx"
 
@@ -26,7 +26,7 @@ os.makedirs(LOG_DIR, exist_ok=True)
 def speak(text):
     print(f"[tts] {text}")
     subprocess.run(
-        f'echo "{text}" | piper --model {PIPER_MODEL} --output_raw | aplay -D plughw:0,0 -r 22050 -f S16_LE -c 1',
+        f'echo "{text}" | piper --model {PIPER_MODEL} --output_raw | aplay -D plughw:2,0 -r 22050 -f S16_LE -c 1',
         shell=True, check=True
     )
 
@@ -36,8 +36,13 @@ def record(duration):
     print(f"[mic] Recording for {duration}s...")
     audio = sd.rec(int(duration * SAMPLERATE), samplerate=SAMPLERATE, channels=1, dtype='float32', device=AUDIO_DEVICE)
     sd.wait()
+
+    # Resample from 48000 to 16000 for Whisper
+    import scipy.signal as signal
+    audio_resampled = signal.resample(audio, int(len(audio) * 16000 / SAMPLERATE))
+
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-        wav.write(f.name, SAMPLERATE, audio)
+        wav.write(f.name, 16000, audio_resampled)
         path = f.name
     with open(path, "rb") as f:
         data = f.read()
