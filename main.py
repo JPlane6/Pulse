@@ -8,7 +8,7 @@ from lidarHelpers import get_stable_distances
 from datetime import datetime
 
 # --- Constants ---
-LIDAR_PORT              = "/dev/ttyUSB0"
+LIDAR_PORT              = "/dev/ttyUSB1"
 OBSTACLE_THRESHOLD_CM   = 35  # Increased to 60cm for reliable stopping (robot moves fast)
 OPENING_INCREASE_CM     = 20
 
