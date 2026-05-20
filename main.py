@@ -1,4 +1,13 @@
+#!/usr/bin/env python3
+"""
+Hospital Gallery Navigation Robot
+===================================
+Navigates corridor, detects room openings, enters room,
+then launches client.py to begin the patient assessment.
+"""
+
 import time
+import subprocess   # ← ADDED: to launch client.py after entering room
 import ydlidar
 from RPLCD.i2c import CharLCD
 import lcd_hello
@@ -7,17 +16,21 @@ import lidarHelpers
 from lidarHelpers import get_stable_distances
 from datetime import datetime
 
-# --- Constants ---
+# --- Constants --- (UNCHANGED)
 LIDAR_PORT              = "/dev/lidar"
-OBSTACLE_THRESHOLD_CM   = 50   # CHANGED: was 35, more braking distance at higher voltage
-OPENING_INCREASE_CM     = 12   # CHANGED: was 20, catch openings earlier
+OBSTACLE_THRESHOLD_CM   = 50
+OPENING_INCREASE_CM     = 12
 
-# --- Turn-and-enter constants (measure these physically) ---
-TURN_DURATION_SEC       = 1    # time in seconds for a 90° turn
-ENTER_SPEED             = 155  # CHANGED: was 170, slowed down so LiDAR can catch openings
-ENTER_DURATION_SEC      = 1    # how long to drive into the room
-ENTER_ROOM_THRESHOLD_CM = 45   # minimum increase to consider it an opening
+# --- Turn-and-enter constants (UNCHANGED) ---
+TURN_DURATION_SEC       = 1
+ENTER_SPEED             = 155
+ENTER_DURATION_SEC      = 1
+ENTER_ROOM_THRESHOLD_CM = 45
 
+
+# ═══════════════════════════════════════════════════════════════════
+#  LCD HELPERS (UNCHANGED)
+# ═══════════════════════════════════════════════════════════════════
 
 def update_lcd(lcd, left_cm, right_cm, front_cm, status_line):
     lcd.cursor_pos = (0, 0)
@@ -46,6 +59,10 @@ def log_distances(front_cm, left_cm, right_cm):
     front_str = f"{front_cm:.1f}" if front_cm is not None else "---"
     print(f"[{ts}] F:{front_str}cm L:{left_cm:.1f}cm R:{right_cm:.1f}cm")
 
+
+# ═══════════════════════════════════════════════════════════════════
+#  MOVEMENT HELPERS (UNCHANGED)
+# ═══════════════════════════════════════════════════════════════════
 
 def move_forward_until_obstacle(laser, lcd=None, threshold_cm=25, speed=ENTER_SPEED):
     motors.go()
@@ -79,9 +96,8 @@ def move_forward_until_obstacle(laser, lcd=None, threshold_cm=25, speed=ENTER_SP
 
 def enter_room(side, laser, lcd=None):
     """
-    Stop, turn 90 degrees toward the opening, then drive forward into the room.
+    Stop, turn 90° toward the opening, drive into the room until threshold.
     side: 'L' or 'R'
-    laser: LiDAR object for distance measurement
     """
     print(f"[enter_room] Turning {side} into opening...")
     if lcd:
@@ -101,6 +117,49 @@ def enter_room(side, laser, lcd=None):
     print(f"[enter_room] Entered room.")
 
 
+# ═══════════════════════════════════════════════════════════════════
+#  PATIENT ASSESSMENT TRIGGER
+#  ← NEW: called after robot enters a room
+# ═══════════════════════════════════════════════════════════════════
+
+def start_patient_assessment(lcd=None):
+    """
+    Launch client.py as a subprocess to begin the patient triage session.
+    This blocks until the full assessment is complete before navigation resumes.
+    The LCD shows ASSESSING while it runs.
+    """
+    print("[assessment] Launching patient assessment (client.py)...")
+
+    if lcd:
+        lcd.clear()
+        lcd.cursor_pos = (0, 0)
+        lcd.write_string("PATIENT".ljust(20))
+        lcd.cursor_pos = (1, 0)
+        lcd.write_string("ASSESSMENT".ljust(20))
+        lcd.cursor_pos = (2, 0)
+        lcd.write_string("IN PROGRESS...".ljust(20))
+
+    # Run client.py and wait for it to finish before continuing navigation
+    result = subprocess.run(["python3", "client.py"], check=False)
+
+    if result.returncode == 0:
+        print("[assessment] Assessment completed successfully.")
+    else:
+        print(f"[assessment] client.py exited with code {result.returncode} — continuing navigation.")
+
+    if lcd:
+        lcd.clear()
+        lcd.cursor_pos = (0, 0)
+        lcd.write_string("ASSESSMENT DONE".ljust(20))
+        lcd.cursor_pos = (1, 0)
+        lcd.write_string("RESUMING NAV...".ljust(20))
+        time.sleep(2)
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  MAIN CONTROL LOOP
+# ═══════════════════════════════════════════════════════════════════
+
 def main():
     try:
         lcd = CharLCD("PCF8574", 0x27, cols=20, rows=4)
@@ -111,6 +170,7 @@ def main():
     lcd.clear()
     lcd_hello.hello()
 
+    # --- LiDAR setup (UNCHANGED) ---
     laser = ydlidar.CYdLidar()
     laser.setlidaropt(ydlidar.LidarPropSerialPort, LIDAR_PORT)
     laser.setlidaropt(ydlidar.LidarPropSerialBaudrate, 128000)
@@ -134,12 +194,12 @@ def main():
 
     scan = ydlidar.LaserScan()
 
-    prev_left_cm = None
+    prev_left_cm  = None
     prev_right_cm = None
-    prev_front_cm = None  # Track previous front distance for sudden-loss detection
+    prev_front_cm = None
     last_turn_time = 0
-    TURN_COOLDOWN = 3.0
-    motor_state = "IDLE"
+    TURN_COOLDOWN  = 3.0
+    motor_state    = "IDLE"
 
     print("=" * 60)
     print("ROBOT NAVIGATION - READY")
@@ -151,27 +211,26 @@ def main():
 
     try:
         while True:
-            # Fast single-scan check for immediate obstacle detection
+            # ─────────────────────────────────────────────────────────────
+            # FAST SCAN: Check front obstacle first, every loop iteration
+            # ─────────────────────────────────────────────────────────────
             if laser.doProcessSimple(scan):
-                front_cm_fast, _, _ = lidarHelpers.get_all_distances(scan, debug=False)  # Debug disabled - working perfectly
+                front_cm_fast, _, _ = lidarHelpers.get_all_distances(scan, debug=False)
 
-                # CRITICAL: Check for obstacle IMMEDIATELY (no averaging delay)
+                # PRIORITY 1: EMERGENCY STOP — obstacle too close
                 if front_cm_fast is not None and front_cm_fast < OBSTACLE_THRESHOLD_CM:
                     if motor_state != "STOPPED":
                         motors.stop()
                         motor_state = "STOPPED"
                         print(f"[main] EMERGENCY STOP - Obstacle at {front_cm_fast:.1f}cm")
 
-                    # Get stable readings for display
                     front_cm, left_cm, right_cm = get_stable_distances(laser, scan, num_scans=3)
                     log_distances(front_cm, left_cm, right_cm)
                     update_lcd(lcd, left_cm, right_cm, front_cm, "OBSTACLE - STOPPED")
 
-                    # Wait until obstacle clears
                     while True:
                         if laser.doProcessSimple(scan):
                             front_check, _, _ = lidarHelpers.get_all_distances(scan)
-
                             if front_check is None or front_check >= OBSTACLE_THRESHOLD_CM:
                                 print("[main] Obstacle cleared — resuming.")
                                 motors.go()
@@ -179,33 +238,28 @@ def main():
                                 motors.arduino.write(cmd.encode('utf-8'))
                                 motors.wait_for("MOVING", timeout=3)
                                 motor_state = "MOVING"
-                                prev_front_cm = None  # Reset tracking
+                                prev_front_cm = None
                                 break
-
-                            # Update display while waiting
                             if laser.doProcessSimple(scan):
                                 front_cm, left_cm, right_cm = get_stable_distances(laser, scan, num_scans=2)
                                 log_distances(front_cm, left_cm, right_cm)
                                 update_lcd(lcd, left_cm, right_cm, front_cm, "OBSTACLE - STOPPED")
-                    continue  # Restart main loop after clearing obstacle
+                    continue
 
-                # FAILSAFE: If front reading suddenly disappears, obstacle likely very close - STOP!
+                # FAILSAFE: reading disappeared while close — likely too close to detect
                 elif front_cm_fast is None and prev_front_cm is not None and prev_front_cm < OBSTACLE_THRESHOLD_CM:
                     if motor_state != "STOPPED":
                         motors.stop()
                         motor_state = "STOPPED"
-                        print(f"[main] EMERGENCY STOP - Obstacle too close (lost detection at {prev_front_cm:.1f}cm)")
+                        print(f"[main] EMERGENCY STOP - Obstacle too close (lost at {prev_front_cm:.1f}cm)")
 
-                    # Get stable readings for display
                     front_cm, left_cm, right_cm = get_stable_distances(laser, scan, num_scans=2)
                     log_distances(front_cm, left_cm, right_cm)
                     update_lcd(lcd, left_cm, right_cm, front_cm, "OBSTACLE - STOPPED")
 
-                    # Wait until obstacle clears
                     while True:
                         if laser.doProcessSimple(scan):
                             front_check, _, _ = lidarHelpers.get_all_distances(scan)
-
                             if front_check is not None and front_check >= OBSTACLE_THRESHOLD_CM:
                                 print("[main] Obstacle cleared — resuming.")
                                 motors.go()
@@ -215,54 +269,58 @@ def main():
                                 motor_state = "MOVING"
                                 prev_front_cm = None
                                 break
-
                             time.sleep(0.1)
                     continue
 
-                # Update previous front for next iteration
                 prev_front_cm = front_cm_fast
 
-            # Get stable distances for normal operation (opening detection, display)
+            # ─────────────────────────────────────────────────────────────
+            # STABLE SCAN: used for opening detection and display
+            # ─────────────────────────────────────────────────────────────
             front_cm, left_cm, right_cm = get_stable_distances(laser, scan, num_scans=2)
             log_distances(front_cm, left_cm, right_cm)
 
-            # PRIORITY 2: LEFT OPENING
+            # PRIORITY 2: LEFT OPENING DETECTED
             if (prev_left_cm is not None and
                     left_cm < 999.0 and
                     left_cm - prev_left_cm > OPENING_INCREASE_CM and
                     time.time() - last_turn_time > TURN_COOLDOWN):
 
-                print(f"[OPENING] LEFT room detected! Distance increased {left_cm - prev_left_cm:.0f}cm ({prev_left_cm:.0f}→{left_cm:.0f}cm)")
-                print(f"[main] Opening on LEFT — stopping and entering | L:{left_cm:.1f} prev:{prev_left_cm:.1f}")
+                print(f"[OPENING] LEFT room detected! {left_cm - prev_left_cm:.0f}cm increase ({prev_left_cm:.0f}→{left_cm:.0f}cm)")
                 motors.stop()
                 update_lcd(lcd, left_cm, right_cm, front_cm, "OPENING LEFT!")
                 time.sleep(0.3)
 
                 enter_room('L', laser, lcd)
 
-                prev_left_cm = left_cm
-                prev_right_cm = right_cm
-                last_turn_time = time.time()
-                motor_state = "MOVING"
+                # ← NEW: assessment starts here, blocks until done
+                start_patient_assessment(lcd)
 
-            # PRIORITY 3: RIGHT OPENING
+                prev_left_cm   = left_cm
+                prev_right_cm  = right_cm
+                last_turn_time = time.time()
+                motor_state    = "MOVING"
+
+            # PRIORITY 3: RIGHT OPENING DETECTED
             elif (prev_right_cm is not None and
                     right_cm < 999.0 and
                     right_cm - prev_right_cm > OPENING_INCREASE_CM and
                     time.time() - last_turn_time > TURN_COOLDOWN):
 
-                print(f"[OPENING] RIGHT room detected! Distance increased {right_cm - prev_right_cm:.0f}cm ({prev_right_cm:.0f}→{right_cm:.0f}cm)")
-                print(f"[main] Opening on RIGHT — stopping and entering | R:{right_cm:.1f} prev:{prev_right_cm:.1f}")
+                print(f"[OPENING] RIGHT room detected! {right_cm - prev_right_cm:.0f}cm increase ({prev_right_cm:.0f}→{right_cm:.0f}cm)")
                 motors.stop()
                 update_lcd(lcd, left_cm, right_cm, front_cm, "OPENING RIGHT!")
                 time.sleep(0.3)
 
                 enter_room('R', laser, lcd)
 
-                prev_right_cm = right_cm
-                prev_left_cm = left_cm
+                # ← NEW: assessment starts here, blocks until done
+                start_patient_assessment(lcd)
+
+                prev_right_cm  = right_cm
+                prev_left_cm   = left_cm
                 last_turn_time = time.time()
-                motor_state = "MOVING"
+                motor_state    = "MOVING"
 
             # PRIORITY 4: DEFAULT — go straight
             else:
@@ -279,9 +337,6 @@ def main():
                 prev_left_cm = left_cm
             if right_cm < 999.0:
                 prev_right_cm = right_cm
-
-            # No sleep - check obstacles as fast as possible
-            # time.sleep(0.05)
 
     except KeyboardInterrupt:
         print("[main] Interrupted.")
