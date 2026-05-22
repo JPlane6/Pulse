@@ -14,7 +14,7 @@ import scipy.signal as signal
 #  CONFIG
 # ═══════════════════════════════════════════════════════════════════
 
-SERVER_URL    = "http://192.168.0.157:5000"
+SERVER_URL    = "http://192.168.0.157:5001"
 MAX_QUESTIONS = 6
 SAMPLERATE    = 48000
 
@@ -383,7 +383,7 @@ def main():
         print("[main] Server unreachable.")
         show_error_on_lcd(lcd, "SERVER OFFLINE", "Check Laptop")
         speak(
-            "I cannot connect to my brain right now."
+            "I cannot connect to my brain right now "
             "Let me visit the doctor!",
             alsa_device
         )
