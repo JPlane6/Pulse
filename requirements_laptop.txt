@@ -4,8 +4,11 @@
 #  HOW TO INSTALL
 #    pip install -r requirements_laptop.txt
 #
-#  READ README.md before installing!!
-#
+#  RECOMMENDED TO USE VENV!
+#    create using command: python3 -m venv <VENV_NAME>
+#    open using command: source <PATH_TO_VENV>/bin/activate
+#  
+#  
 #  Read the "Cannot Be Installed With Pip" section at the
 #  bottom before running pip. Several things need to be set
 #  up manually first or the server will fail at runtime.
