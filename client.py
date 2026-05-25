@@ -19,7 +19,7 @@ from silero_vad import load_silero_vad, VADIterator
 
 SERVER_URL    = "http://192.168.0.157:5001"
 MAX_QUESTIONS = 6
-SAMPLERATE    = 16000          # Record at 16kHz natively — Silero + Whisper both want this
+SAMPLERATE    = 16000          # Target rate for Silero + Whisper
 
 AUDIO_DEVICE_KEYWORD = "USB"   # Keyword matched against aplay/arecord/PortAudio device names
 
@@ -207,15 +207,20 @@ def speak_chunk(chunk, alsa_device):
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  AUDIO RECORDING — Silero VAD
+#  AUDIO RECORDING — Safe Native Capture & Resampling
 # ═══════════════════════════════════════════════════════════════════
 
 def record(pa_device_index, silence_duration=VAD_SILENCE_DURATION, max_duration=VAD_MAX_DURATION):
     """
-    Record using Silero VAD — stops automatically when patient goes quiet.
-    silence_duration: seconds of silence before stopping
-    max_duration: hard cap so robot never hangs
+    Record using hardware's native rate (48kHz) to bypass ALSA stream errors, 
+    and downsample to 16kHz inside Python for Silero VAD and Whisper.
     """
+    try:
+        device_info = sd.query_devices(pa_device_index, 'input')
+        native_sr = int(device_info['default_samplerate'])
+    except Exception:
+        native_sr = 48000  # Target hardware profile default
+
     vad_iterator = VADIterator(
         vad_model,
         threshold=VAD_THRESHOLD,
@@ -224,29 +229,35 @@ def record(pa_device_index, silence_duration=VAD_SILENCE_DURATION, max_duration=
         speech_pad_ms=100
     )
 
-    silence_frames_needed = int(silence_duration * SAMPLERATE / VAD_FRAME_SAMPLES)
-    max_frames            = int(max_duration * SAMPLERATE / VAD_FRAME_SAMPLES)
+    # Scale the incoming hardware block window proportionally to match Silero's 512 target
+    hw_blocksize = int(VAD_FRAME_SAMPLES * (native_sr / SAMPLERATE))
+    silence_frames_needed = int(silence_duration * native_sr / hw_blocksize)
+    max_frames            = int(max_duration * native_sr / hw_blocksize)
 
     frames          = []
     silent_frames   = 0
     started_speaking = False
 
-    print(f"[mic] Listening with Silero VAD (index={pa_device_index})...")
+    print(f"[mic] Listening safely at hardware native {native_sr}Hz...")
 
     try:
         with sd.InputStream(
-            samplerate=SAMPLERATE,
+            samplerate=native_sr,
             channels=1,
             dtype='int16',
             device=pa_device_index,
-            blocksize=VAD_FRAME_SAMPLES
+            blocksize=hw_blocksize
         ) as stream:
             for _ in range(max_frames):
-                frame, _ = stream.read(VAD_FRAME_SAMPLES)
+                frame, _ = stream.read(hw_blocksize)
                 frames.append(frame.copy())
 
-                # Convert int16 → float32 tensor for Silero
-                tensor = torch.frombuffer(frame.tobytes(), dtype=torch.int16).float() / 32768.0
+                # Flatten array and downsample block to float32 for Silero framework evaluation
+                f32_frame = frame.flatten().astype(np.float32) / 32768.0
+                target_num_samples = int(len(f32_frame) * SAMPLERATE / native_sr)
+                resampled_f32 = signal.resample(f32_frame, target_num_samples)
+                tensor = torch.from_numpy(resampled_f32).float()
+
                 confidence = vad_model(tensor, SAMPLERATE).item()
 
                 if confidence > VAD_THRESHOLD:
@@ -265,10 +276,15 @@ def record(pa_device_index, silence_duration=VAD_SILENCE_DURATION, max_duration=
     if not frames:
         return b""
 
-    audio = np.concatenate(frames, axis=0)
+    # Combine captured native array fragments
+    audio_raw = np.concatenate(frames, axis=0).flatten()
+
+    # Re-sample whole audio clip package smoothly to 16000Hz for Whisper STT
+    total_samples = int(len(audio_raw) * SAMPLERATE / native_sr)
+    audio_16k = signal.resample(audio_raw, total_samples).astype(np.int16)
 
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-        wav.write(f.name, SAMPLERATE, audio)
+        wav.write(f.name, SAMPLERATE, audio_16k)
         path = f.name
 
     with open(path, "rb") as f:
