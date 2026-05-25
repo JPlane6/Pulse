@@ -43,6 +43,9 @@ torch
 silero-vad
 # Dynamic silence threshold iterator to eliminate fixed audio recording caps.
 
+gpiod
+# allows Pi to use GPIO pins to run the LEDs
+
 # ============================================================
 #  CANNOT BE INSTALLED WITH PIP
 #  Set these up manually before running client.py or main.py.

@@ -24,16 +24,17 @@ SAMPLERATE       = 16000          # Internal rate needed by Silero/Whisper
 AUDIO_DEVICE_KEYWORD = "USB"      # Identifies your target USB mic & speaker
 PIPER_MODEL      = "/home/ayushs0604/Pulse/en_US-amy-medium.onnx"
 
-# --- Feature 3: Barge-In Interruption Toggle ---
-BARGE_IN_ENABLED = True           # Set to False to disable user interrupting the robot
+# --- Feature 3: Barge-In Interruption Toggle & Tuning ---
+BARGE_IN_ENABLED     = True       # Set to False to disable user interrupting the robot
+VAD_THRESHOLD        = 0.75       # Stricter confidence filter (0.0 to 1.0) to prevent false hits
+BARGE_IN_IGNORE_SECS = 0.4        # Time buffer to ignore initial speaker pop/echo sounds
 
-# --- Feature 4: RGB Status LED Pin Layout (GPIO BCM numbering) ---
+# --- Feature 4: RGB Status LED Pin Layout (GPIO Line Offsets) ---
 LED_RED_PIN      = 17             # Lights up for URGENT status
 LED_GREEN_PIN    = 27             # Lights up for STABLE status
 LED_BLUE_PIN     = 22             # Lights up for MONITOR status
 
 # --- Silero VAD configurations ---
-VAD_THRESHOLD         = 0.5    # Speech confidence sensitivity cutoff
 VAD_SILENCE_DURATION  = 1.5    # Seconds of silence required to close recording
 VAD_MAX_DURATION      = 15     # Safety stop cap to prevent infinite loop listening
 VAD_FRAME_SAMPLES     = 512    # Core sample slice evaluation window size
@@ -59,48 +60,59 @@ print("[vad] Loading Silero VAD framework...")
 vad_model = load_silero_vad()
 print("[vad] Silero VAD framework loaded.")
 
-# Safe initialization of GPIO pins for Pi 5
+# Native initialization of GPIO lines for Pi 5 using gpiod
 GPIO_AVAILABLE = False
+RED_LINE = None
+GREEN_LINE = None
+BLUE_LINE = None
+
 try:
-    import RPi.GPIO as GPIO
-    GPIO.setmode(GPIO.BCM)
-    GPIO.setwarnings(False)
-    GPIO.setup(LED_RED_PIN, GPIO.OUT)
-    GPIO.setup(LED_GREEN_PIN, GPIO.OUT)
-    GPIO.setup(LED_BLUE_PIN, GPIO.OUT)
-    GPIO.output(LED_RED_PIN, GPIO.LOW)
-    GPIO.output(LED_GREEN_PIN, GPIO.LOW)
-    GPIO.output(LED_BLUE_PIN, GPIO.LOW)
+    import gpiod
+    # Raspberry Pi 5 core GPIO hardware mapping uses gpiochip4
+    LED_CHIP = gpiod.Chip('gpiochip4')
+    
+    RED_LINE = LED_CHIP.get_line(LED_RED_PIN)
+    GREEN_LINE = LED_CHIP.get_line(LED_GREEN_PIN)
+    BLUE_LINE = LED_CHIP.get_line(LED_BLUE_PIN)
+    
+    RED_LINE.request(consumer="PULSE", type=gpiod.LINE_REQ_DIR_OUT)
+    GREEN_LINE.request(consumer="PULSE", type=gpiod.LINE_REQ_DIR_OUT)
+    BLUE_LINE.request(consumer="PULSE", type=gpiod.LINE_REQ_DIR_OUT)
+    
+    RED_LINE.set_value(0)
+    GREEN_LINE.set_value(0)
+    BLUE_LINE.set_value(0)
+    
     GPIO_AVAILABLE = True
-    print("[gpio] LED Pins successfully initialized and verified.")
+    print("[gpio] Raspberry Pi 5 gpiod Lines successfully initialized.")
 except Exception as e:
-    print(f"[gpio] Optional GPIO libraries or LEDs not detected ({e}). Continuing in simulation mode safely.")
+    print(f"[gpio] Raspberry Pi 5 gpiod setup bypassed ({e}). Operating in text simulation mode safely.")
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  FEATURE 4: LED HARDWARE WRAPPER (Won't break if missing!)
+#  FEATURE 4: LED HARDWARE WRAPPER 
 # ═══════════════════════════════════════════════════════════════════
 
 def set_status_led(status_type):
-    """Sets the RGB LED color matching your requirements. Safely falls back if un-wired."""
+    """Sets physical RGB LED pin configurations via gpiod. Fails gracefully if missing."""
     if not GPIO_AVAILABLE:
         print(f"[led-simulation] Status updated to color profile: {status_type}")
         return
 
     try:
-        # Clear all pins first
-        GPIO.output(LED_RED_PIN, GPIO.LOW)
-        GPIO.output(LED_GREEN_PIN, GPIO.LOW)
-        GPIO.output(LED_BLUE_PIN, GPIO.LOW)
+        # Reset all channels low
+        RED_LINE.set_value(0)
+        GREEN_LINE.set_value(0)
+        BLUE_LINE.set_value(0)
 
         if status_type == "URGENT":
-            GPIO.output(LED_RED_PIN, GPIO.HIGH)    # Red for Urgent
+            RED_LINE.set_value(1)
         elif status_type == "MONITOR":
-            GPIO.output(LED_BLUE_PIN, GPIO.HIGH)   # Blue for Monitor
+            BLUE_LINE.set_value(1)
         else:
-            GPIO.output(LED_GREEN_PIN, GPIO.HIGH)  # Green for Stable
+            GREEN_LINE.set_value(1)
     except Exception as e:
-        print(f"[gpio] LED hardware adjustment hit an exception: {e}")
+        print(f"[gpio] LED hardware execution encountered an error: {e}")
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -108,7 +120,7 @@ def set_status_led(status_type):
 # ═══════════════════════════════════════════════════════════════════
 
 def run_microphone_calibration(pa_device_index):
-    """Listens to environment to guarantee the hardware isn't zeroed out or muted."""
+    """Verifies that the USB mic line captures active signal energy (checks if muted)."""
     print("[calibration] Executing 2-second microphone system diagnostic check...")
     try:
         device_info = sd.query_devices(pa_device_index, 'input')
@@ -117,16 +129,14 @@ def run_microphone_calibration(pa_device_index):
         native_sr = 48000
 
     try:
-        # Record a silent 2 second window frame
         recording = sd.rec(int(2.0 * native_sr), samplerate=native_sr, channels=1, dtype='int16', device=pa_device_index)
         sd.wait()
         
-        # Calculate Root Mean Square energy metrics
         rms = np.sqrt(np.mean(recording.flatten()**2))
         print(f"[calibration] Diagnostic captured absolute baseline signal energy RMS: {rms:.2f}")
         
-        if rms < 1.0: # Absolute computational silence implies physical connection/mixer fault
-            print("[calibration] FATAL: Audio track contains no signal energy. Microphone is muted or unlinked.")
+        if rms < 1.0:
+            print("[calibration] FATAL: Audio input holds no signal energy. Check if physical hardware is muted.")
             return False
         return True
     except Exception as e:
@@ -139,7 +149,8 @@ def run_microphone_calibration(pa_device_index):
 # ═══════════════════════════════════════════════════════════════════
 
 def monitor_barge_in(aplay_process, piper_process, pa_device_index):
-    """Background monitoring thread that instantly stops speech if patient talks."""
+    """Background monitoring thread with echo suppression and tuned VAD thresholds."""
+    start_time = time.time()
     try:
         device_info = sd.query_devices(pa_device_index, 'input')
         native_sr = int(device_info['default_samplerate'])
@@ -150,15 +161,20 @@ def monitor_barge_in(aplay_process, piper_process, pa_device_index):
     
     try:
         with sd.InputStream(samplerate=native_sr, channels=1, dtype='int16', device=pa_device_index, blocksize=hw_blocksize) as stream:
-            while aplay_process.poll() is None:  # While audio is actively playing out
+            while aplay_process.poll() is None:
                 frame, _ = stream.read(hw_blocksize)
+                
+                # Suppress checking during the exact initial fraction of a second to prevent speaker click triggers
+                if time.time() - start_time < BARGE_IN_IGNORE_SECS:
+                    continue
+                    
                 f32_frame = frame.flatten().astype(np.float32) / 32768.0
                 target_num_samples = int(len(f32_frame) * SAMPLERATE / native_sr)
                 resampled_f32 = signal.resample(f32_frame, target_num_samples)
                 tensor = torch.from_numpy(resampled_f32).float()
 
                 if vad_model(tensor, SAMPLERATE).item() > VAD_THRESHOLD:
-                    print("\n[barge-in] User voice interruption detected! Terminating playback processes instantly.")
+                    print("\n[barge-in] Confident human voice override detected! Killing playback.")
                     aplay_process.terminate()
                     piper_process.terminate()
                     break
@@ -236,7 +252,6 @@ def speak(text, alsa_device, pa_device_index=None):
             stdin=piper.stdout, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
         )
         
-        # Deploy Interruption processing thread if explicitly enabled and inputs pass
         if BARGE_IN_ENABLED and (pa_device_index is not None):
             barge_thread = threading.Thread(target=monitor_barge_in, args=(aplay, piper, pa_device_index), daemon=True)
             barge_thread.start()
@@ -245,7 +260,7 @@ def speak(text, alsa_device, pa_device_index=None):
         piper.stdin.close()
         aplay.wait()
         piper.wait()
-        time.sleep(0.6)  # Safety pad gives physical speakers structural completion time
+        time.sleep(0.6)
     except Exception as e:
         print(f"[tts] Execution hit error: {e}")
 
@@ -321,7 +336,6 @@ def record(pa_device_index, silence_duration=VAD_SILENCE_DURATION, max_duration=
 # ═══════════════════════════════════════════════════════════════════
 
 def get_next_question_streaming(history, alsa_device, pa_device_index=None):
-    """Pipes token streams directly to Piper processes word-by-word instantly."""
     try:
         r = requests.post(f"{SERVER_URL}/next_question", json={"history": history}, stream=True, timeout=60)
         full_text = ""
@@ -349,7 +363,7 @@ def get_next_question_streaming(history, alsa_device, pa_device_index=None):
             if len(word_buffer) >= 2:
                 phrase = "".join(word_buffer)
                 print(f"[stream] Writing chunk: '{phrase}'", end="", flush=True)
-                if piper.poll() is None: # Secure pipe checks case of sudden user barge-in hits
+                if piper.poll() is None:
                     try:
                         piper.stdin.write(phrase.encode("utf-8"))
                         piper.stdin.flush()
@@ -412,7 +426,7 @@ def confirm_answer(answer_text, alsa_device, pa_device_index):
     current_answer = answer_text
 
     for attempt in range(MAX_CONFIRM_RETRIES + 1):
-        # Local Ambiguity Capture: Handle empty records or unintelligible static inputs directly
+        # Local Ambiguity Filter: Catch empty loops or short static noise before sending to LLM
         if not current_answer.strip() or len(current_answer.strip()) < 2:
             print("[confirm-local] Caught empty or ambiguous string entry. Requesting clarification.")
             speak("I didn't quite catch that. Could you please repeat your response clearly?", alsa_device, pa_device_index)
@@ -517,7 +531,7 @@ def main():
         speak("I cannot hear you right now. My microphone is disconnected.", alsa_device)
         return
 
-    # Feature 5: Run mic hardware audio calibration checks
+    # Feature 5 Run: Core micro-mixer calibration pass
     if not run_microphone_calibration(pa_input_index):
         show_error_on_lcd(lcd, "MIC MUTED / ERROR", "Run Mixer Checks")
         speak("My microphone is muted or failing diagnostic checks.", alsa_device)
@@ -540,7 +554,7 @@ def main():
         lcd.clear()
         lcd.write_string("PULSE READY")
 
-    # Feature 4 Setup: Initialize Default State LED (Stable = Green)
+    # Establish baseline healthy status LED on run start
     set_status_led("STABLE")
 
     speak(f"Hello {patient_name}! I am your nurse assistant robot. Let's check in on you.", alsa_device, pa_input_index)
@@ -559,7 +573,6 @@ def main():
     history.append({"q": first_q, "a": answer, "status": answer_status})
     if priority[answer_status] > priority[status]: status = answer_status
     
-    # Update physical LED status color dynamically
     set_status_led(status)
     print(f"[status-update] Current Patient Status Evaluation: {status}")
 
@@ -578,7 +591,6 @@ def main():
         history.append({"q": next_q, "a": answer, "status": answer_status})
         if priority[answer_status] > priority[status]: status = answer_status
         
-        # Update physical LED status color dynamically
         set_status_led(status)
         print(f"[status-update] Current Patient Status Evaluation: {status}")
 
@@ -602,5 +614,13 @@ if __name__ == "__main__":
     try:
         main()
     finally:
+        # Clear allocated lines down to absolute safe low states on application kill
         if GPIO_AVAILABLE:
-            GPIO.cleanup() # Clean up pin allocations gracefully on termination
+            try:
+                RED_LINE.set_value(0)
+                GREEN_LINE.set_value(0)
+                BLUE_LINE.set_value(0)
+                RED_LINE.release()
+                GREEN_LINE.release()
+                BLUE_LINE.release()
+            except Exception: pass
