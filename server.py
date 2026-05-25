@@ -6,7 +6,10 @@ from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# --- Config ---
+# ═══════════════════════════════════════════════════════════════════
+#  CONFIG
+# ═══════════════════════════════════════════════════════════════════
+
 OLLAMA_URL = "http://localhost:11434/api/generate"
 TEXT_MODEL = "phi3:mini"
 
@@ -15,23 +18,52 @@ URGENT_KEYWORDS  = ["severe", "chest", "can't breathe", "cannot breathe",
 MONITOR_KEYWORDS = ["dizzy", "nausea", "pain", "uncomfortable",
                     "worse", "7", "8", "9", "medication", "no", "bad"]
 
-# --- Load Whisper ---
+# ═══════════════════════════════════════════════════════════════════
+#  LOAD WHISPER
+# ═══════════════════════════════════════════════════════════════════
+
 print("[server] Loading Whisper...")
 whisper_model = whisper.load_model("base")
 print("[server] Whisper ready!")
 
 
-# --- Keyword Status Check ---
+# ═══════════════════════════════════════════════════════════════════
+#  HELPERS
+# ═══════════════════════════════════════════════════════════════════
+
 def assess(text):
+    """Keyword-based triage status from transcribed text."""
     text = text.lower()
     if any(w in text for w in URGENT_KEYWORDS):  return "URGENT"
     if any(w in text for w in MONITOR_KEYWORDS): return "MONITOR"
     return "STABLE"
 
 
-# --- Route: Transcribe Audio ---
+# ═══════════════════════════════════════════════════════════════════
+#  ROUTE: Health check
+# ═══════════════════════════════════════════════════════════════════
+
+@app.route("/ping", methods=["GET"])
+def ping():
+    """
+    Simple health check endpoint.
+    The Pi calls this before starting any session to confirm
+    the server is up and reachable. Returns 200 + {"status": "ok"}.
+    """
+    print("[ping] Pi connected.")
+    return jsonify({"status": "ok"})
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  ROUTE: Transcribe audio
+# ═══════════════════════════════════════════════════════════════════
+
 @app.route("/transcribe", methods=["POST"])
 def transcribe():
+    """
+    Receive raw WAV bytes from the Pi, run Whisper STT,
+    return transcribed text + triage status keyword assessment.
+    """
     try:
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
             f.write(request.data)
@@ -50,9 +82,17 @@ def transcribe():
         return jsonify({"text": "", "status": "STABLE"})
 
 
-# --- Route: Generate Next Question ---
+# ═══════════════════════════════════════════════════════════════════
+#  ROUTE: Generate next triage question
+# ═══════════════════════════════════════════════════════════════════
+
 @app.route("/next_question", methods=["POST"])
 def next_question():
+    """
+    Receive conversation history from the Pi, ask Phi3:mini for
+    the single best follow-up question (or DONE if enough info gathered).
+    First line only is returned to guard against model rambling.
+    """
     try:
         history = request.get_json()["history"]
         history_text = "\n".join([f"Q: {qa['q']}\nA: {qa['a']}" for qa in history])
@@ -71,7 +111,12 @@ def next_question():
             "Next question (or DONE):"
         )
 
-        r = requests.post(OLLAMA_URL, json={"model": TEXT_MODEL, "prompt": prompt, "stream": False}, timeout=60)
+        r = requests.post(
+            OLLAMA_URL,
+            json={"model": TEXT_MODEL, "prompt": prompt, "stream": False},
+            timeout=60
+        )
+        # First line only — guards against Phi3 rambling after the question
         question = r.json()["response"].strip().split("\n")[0]
 
         print(f"[next_question] {question}")
@@ -82,9 +127,17 @@ def next_question():
         return jsonify({"question": "DONE"})
 
 
-# --- Route: Flag Urgent ---
+# ═══════════════════════════════════════════════════════════════════
+#  ROUTE: Final urgent flag
+# ═══════════════════════════════════════════════════════════════════
+
 @app.route("/flag_urgent", methods=["POST"])
 def flag_urgent():
+    """
+    Receive full conversation history, ask Phi3:mini to make a
+    final YES/NO call on whether the patient should be flagged URGENT.
+    More reliable than keyword matching alone for edge cases.
+    """
     try:
         history = request.get_json()["history"]
         history_text = "\n".join([f"Q: {qa['q']}\nA: {qa['a']}" for qa in history])
@@ -99,10 +152,15 @@ def flag_urgent():
             "Reply with only YES or NO."
         )
 
-        r = requests.post(OLLAMA_URL, json={"model": TEXT_MODEL, "prompt": prompt, "stream": False}, timeout=60)
-        result = r.json()["response"].strip().upper().split("\n")[0]
-
+        r = requests.post(
+            OLLAMA_URL,
+            json={"model": TEXT_MODEL, "prompt": prompt, "stream": False},
+            timeout=60
+        )
+        # First line only — guards against extra text after YES/NO
+        result  = r.json()["response"].strip().upper().split("\n")[0]
         flagged = "YES" in result
+
         print(f"[flag_urgent] {result} → flagged={flagged}")
         return jsonify({"flagged_urgent": flagged})
 
@@ -111,7 +169,10 @@ def flag_urgent():
         return jsonify({"flagged_urgent": False})
 
 
-# --- Start Server ---
+# ═══════════════════════════════════════════════════════════════════
+#  START
+# ═══════════════════════════════════════════════════════════════════
+
 if __name__ == "__main__":
     print("[server] Starting on 0.0.0.0:5000")
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    app.run(host="0.0.0.0", port=5001, debug=False)

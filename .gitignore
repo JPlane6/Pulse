@@ -13,12 +13,10 @@ en_US-amy-medium.onnx.json
 
 
 # Large model files — do not commit these
-vosk-model-small-en-us-0.15/
 *.zip
 *.pt
 *.pth
 
 #log files
-
 modules/logs/
 # Ollama models are stored system-wide, not in project

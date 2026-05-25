@@ -1,25 +1,109 @@
-# Pulse — Laptop (Mac) Requirements
-# Run: pip install -r requirements_laptop.txt
+# ============================================================
+#  PULSE — MacBook (AI Server) Requirements
+#
+#  HOW TO INSTALL
+#    pip install -r requirements_laptop.txt
+#
+#  RECOMMENDED TO USE VENV!
+#    create using command: python3 -m venv <VENV_NAME>
+#    open using command: source <PATH_TO_VENV>/bin/activate
+#  
+#  
+#  Read the "Cannot Be Installed With Pip" section at the
+#  bottom before running pip. Several things need to be set
+#  up manually first or the server will fail at runtime.
+# ============================================================
 
-opencv-python   # camera input and drawing bounding boxes
-torch           # ML framework — powers YOLOv8, M2 GPU acceleration
-torchvision     # torch image processing utilities
-torchaudio      # torch audio utilities
-ultralytics     # YOLOv8 object detection
-openai-whisper  # speech to text — runs on M2 GPU
-sounddevice     # microphone audio (for local testing only)
-scipy           # save audio as WAV for Whisper
-flask           # web server — receives requests from Pi
-requests        # send requests to Ollama
 
-# --- NOT pip installable ---
+# ============================================================
+#  PIP PACKAGES
+# ============================================================
 
-# Ollama (local AI — phi3:mini for questions, llava for vision):
-# curl -fsSL https://ollama.com/install.sh | sh
-# ollama pull phi3:mini
-# ollama pull llava
+openai-whisper
+# The speech-to-text model. Converts the patient's recorded
+# audio into text. Runs on the MacBook's M2 GPU using PyTorch's
+# MPS backend. PULSE uses the "base" model — fast and accurate
+# enough for clear English speech in a hospital setting.
+# Important: fp16 is disabled in server.py because Apple's MPS
+# backend does not support it for Whisper. Do not remove that flag.
 
-# ffmpeg (required by Whisper):
-# brew install ffmpeg
+flask
+# The web framework that makes server.py into an API the Pi
+# can call over WiFi. Hosts three endpoints — one for audio
+# transcription, one for question generation, and one for the
+# final urgency decision. Runs on port 5001.
 
-# threading, time, json, os, tempfile — Python standard library
+requests
+# Used in server.py to send prompts to the Ollama API running
+# locally on the same machine. Ollama exposes its own HTTP API
+# and requests is how Python talks to it.
+
+torch
+# PyTorch — the deep learning framework that powers Whisper.
+# On Apple Silicon, this automatically enables the MPS backend
+# for M2 GPU acceleration. Install the standard pip version,
+# MPS support is included out of the box on recent builds.
+
+torchvision
+# Required alongside torch for a complete PyTorch installation.
+# Not called directly in PULSE but torch will raise errors in
+# some environments without it present.
+
+torchaudio
+# Required alongside torch for audio tensor support.
+# Same situation as torchvision — needed for a stable PyTorch
+# setup even though PULSE does not call it directly.
+
+numpy
+# Core array and math library. Whisper and torch both depend
+# on it internally. Also used directly for audio data handling.
+
+
+# ============================================================
+#  CANNOT BE INSTALLED WITH PIP
+#  Set these up manually before running server.py.
+# ============================================================
+
+# ------------------------------------------------------------
+#  FFMPEG
+# ------------------------------------------------------------
+# Whisper needs ffmpeg to decode audio files. Without it,
+# Whisper will fail on certain formats with a cryptic error.
+#
+# Install:
+#   brew install ffmpeg
+#
+# Confirm:
+#   ffmpeg -version
+
+# ------------------------------------------------------------
+#  OLLAMA + PHI3:MINI
+# ------------------------------------------------------------
+# Ollama is the runtime that hosts Phi3:mini locally on your
+# machine. Phi3:mini is the AI model that generates the triage
+# questions and makes the final yes/no urgency decision.
+# It is about 2.3GB.
+#
+# Install Ollama:
+#   curl -fsSL https://ollama.com/install.sh | sh
+#
+# Download the model:
+#   ollama pull phi3:mini
+#
+# Start Ollama before launching server.py:
+#   ollama serve
+#
+# Confirm it is running:
+#   curl http://localhost:11434/api/tags
+#
+# IMPORTANT — Do NOT pull llava. LLaVA is a 4.9GB vision model
+# that was used in an earlier version of PULSE for visual
+# triage via camera. It was removed from the pipeline because
+# running it alongside Phi3:mini on 16GB RAM causes the machine
+# to hit swap and become unusably slow. It is not used anywhere
+# in the current codebase.
+
+# ------------------------------------------------------------
+#  STANDARD LIBRARY — already in Python, nothing to install
+# ------------------------------------------------------------
+# os, tempfile, threading, time, json
