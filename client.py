@@ -144,6 +144,7 @@ def speak(text, alsa_device):
         piper.stdin.close()
         aplay.wait()
         piper.wait()
+        time.sleep(0.6)  # ← FIX: Safety pad gives the physical hardware audio buffer time to bleed out completely
     except Exception as e:
         print(f"[tts] Execution hit error: {e}")
 
@@ -153,7 +154,7 @@ def speak(text, alsa_device):
 # ═══════════════════════════════════════════════════════════════════
 
 def record(pa_device_index, silence_duration=VAD_SILENCE_DURATION, max_duration=VAD_MAX_DURATION):
-    """Records at microphone's native 48kHz rate and clean resamples down to 16kHz."""
+    """Records at microphone's native rate and clean resamples down to 16kHz."""
     try:
         device_info = sd.query_devices(pa_device_index, 'input')
         native_sr = int(device_info['default_samplerate'])
@@ -276,6 +277,7 @@ def get_next_question_streaming(history, alsa_device):
         piper.stdin.close()
         aplay.wait()
         piper.wait()
+        time.sleep(0.6)  # ← FIX: Safety pad ensures streamed questions don't get chopped off prematurely at the last word
 
         result = full_text.strip().split("\n")[0]
         return result
@@ -468,11 +470,17 @@ def main():
 
     history.append({"q": first_q, "a": answer, "status": answer_status})
     if priority[answer_status] > priority[status]: status = answer_status
+    
+    # ← FIX: Re-added the immediate running status terminal trace right after Q1
+    print(f"[status-update] Current Patient Status Evaluation: {status}")
 
     # Stream follow-up conversation matrix segments
     for i in range(MAX_QUESTIONS - 1):
+        print(f"\n--- Follow-up Question Cycle {i+1} of {MAX_QUESTIONS-1} ---")
         next_q = get_next_question_streaming(history, alsa_device)
+        
         if next_q.strip().upper() == "DONE":
+            print("[main] LLM invoked 'DONE' signal. Ending session loop early.")
             break
 
         audio = record(pa_device_index=pa_input_index)
@@ -481,7 +489,11 @@ def main():
 
         history.append({"q": next_q, "a": answer, "status": answer_status})
         if priority[answer_status] > priority[status]: status = answer_status
+        
+        # ← FIX: Re-added running triage status logging feedback block
+        print(f"[status-update] Current Patient Status Evaluation: {status}")
 
+    print("\n--- Finalizing Triage Decisions ---")
     flagged_urgent = check_urgent(history)
     if flagged_urgent:
         status = "URGENT"
