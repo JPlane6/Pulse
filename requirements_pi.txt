@@ -2,69 +2,46 @@
 #  PULSE — Raspberry Pi (Robot Client) Requirements
 #
 #  HOW TO INSTALL
-#    pip install -r requirements_pi.txt --break-system-packages
-#  
-#  RECOMMENDED TO USE VENV!
-#    create using command: python3 -m venv <VENV_NAME>
-#    open using command: source <PATH_TO_VENV>/bin/activate
+#    If using a virtual environment (VENV):
+#      pip install -r requirements_pi.txt
 #
-#  The --break-system-packages flag is required on Raspberry
-#  Pi OS because the OS manages Python system-wide and pip
-#  needs explicit permission to install into it.
-#
-#  Read the "Cannot Be Installed With Pip" section at the
-#  bottom before running pip. Several things need to be set
-#  up manually first or the robot will fail at runtime.
+#    If installing globally to system packages:
+#      pip install -r requirements_pi.txt --break-system-packages
 # ============================================================
-
 
 # ============================================================
 #  PIP PACKAGES
 # ============================================================
 
 requests
-# Used in client.py to send audio recordings and conversation
-# history to the MacBook server over WiFi, and to receive
-# transcriptions and AI-generated questions back.
+# Sends audio data and history JSON structures to your Mac server.
 
 pyserial
-# Handles serial communication between the Pi and the Arduino.
-# motorControl_Pi.py uses this to send drive commands like
-# MOVE, TURN, STOP, and GO to the Arduino over USB.
+# Serial interface link between the Pi and the Arduino Mega motor driver.
 
 RPLCD
-# Driver for the 20x4 I2C LCD screen on the robot. Used in
-# lcd_hello.py and client.py to display navigation status,
-# live sensor distances, and the final triage result.
+# High-level character driver for the 20x4 I2C LCD screen.
 
 smbus2
-# Low-level I2C bus library that RPLCD depends on to talk to
-# the LCD over the Pi's I2C pins. Must be installed or RPLCD
-# will fail to initialize the screen.
+# Underpinning I2C system communication link for RPLCD layer calls.
 
 sounddevice
-# Records audio from the USB headset microphone using PortAudio
-# as the backend. Returns audio as a numpy array for processing.
-# Important: sounddevice uses PortAudio integer device indexes,
-# not ALSA device strings. client.py detects the correct index
-# automatically on startup and prints the full device list so
-# you can confirm the headset was found.
+# Handles safe 48kHz audio recordings from the USB headset mic.
 
 scipy
-# Used in client.py for two things: resampling the recorded
-# audio from 48kHz (the headset's native rate) down to 16kHz
-# which is what Whisper expects, and writing the result to a
-# temporary WAV file that gets sent to the server.
+# Downsamples audio streams dynamically to 16kHz via signal processing profiles.
 
 numpy
-# Core array and math library used by sounddevice and scipy
-# for audio data handling. Required by both.
+# Array library facilitating multi-channel wave data processing.
 
 opencv-python
-# Camera capture and image processing. Used in test_patient.py
-# for the legacy visual triage feature. Visual triage is
-# disabled in the main pipeline but kept here for future use.
+# Retained fallback layer for image captures and diagnostic testing.
 
+torch
+# Required on the Pi to process local Silero VAD frame computations.
+
+silero-vad
+# Dynamic silence threshold iterator to eliminate fixed audio recording caps.
 
 # ============================================================
 #  CANNOT BE INSTALLED WITH PIP
@@ -72,115 +49,46 @@ opencv-python
 # ============================================================
 
 # ------------------------------------------------------------
-#  SYSTEM PACKAGES  (install these first, before anything else)
+#  SYSTEM DEPENDENCIES & ALSA UTILITIES
 # ------------------------------------------------------------
-# These are required to build the YDLidar SDK and to enable
-# the LCD screen. Run this before doing anything else on a
-# fresh Pi:
-#
+# Run these terminal operations to configure base image tools:
 #   sudo apt-get update
-#   sudo apt-get install -y i2c-tools python3-dev cmake swig
+#   sudo apt-get install -y i2c-tools python3-dev cmake swig libgfortran5 libatlas-base-dev
 
 # ------------------------------------------------------------
-#  I2C  (for the LCD screen)
+#  I2C BUS CONFIGURATION (LCD Screen)
 # ------------------------------------------------------------
-# I2C must be enabled in raspi-config before the LCD will work.
+# Interface configuration sequence:
+#   sudo raspi-config -> Interface Options -> I2C -> Enable
 #
-#   sudo raspi-config
-#   Navigate to: Interface Options > I2C > Enable
-#
-# After enabling, verify the LCD is wired and detected:
+# Hardware address line verification:
 #   i2cdetect -y 1
-#
-# You should see "27" in the output grid. That is the LCD at
-# address 0x27. If nothing shows up, check your wiring —
-# SDA connects to GPIO 2 (pin 3), SCL connects to GPIO 3 (pin 5).
+#   (Should output matching cell '27')
 
 # ------------------------------------------------------------
-#  PIPER TTS  (text to speech)
+#  PIPER LOCAL TEXT-TO-SPEECH
 # ------------------------------------------------------------
-# Piper is the voice engine PULSE uses to speak to patients.
-# It generates audio and pipes it directly to aplay for output
-# through the USB headset speaker.
-#
-# Install Piper:
+# Engine setup:
 #   pip install piper-tts --break-system-packages
 #
-# Download the voice model (both files are required):
+# Model payload components (Place inside /home/ayushs0604/Pulse/):
 #   wget https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/amy/medium/en_US-amy-medium.onnx
 #   wget https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/amy/medium/en_US-amy-medium.onnx.json
-#
-# Move both files to the path set by PIPER_MODEL in client.py.
-# The default is /home/ayushs0604/Pulse/ — update this to
-# match your actual home directory if it is different.
 
 # ------------------------------------------------------------
-#  YDLIDAR SDK  (LiDAR sensor driver)
+#  YDLIDAR SCANNER DRIVER
 # ------------------------------------------------------------
-# The Python driver for the YDLidar X4 sensor. There is no
-# pip package — it must be built from source.
-#
-# Make sure you installed python3-dev, cmake, and swig first
-# from the system packages step above, then run:
-#
+# Clone, configure, and install python bindings locally from source:
 #   git clone https://github.com/YDLIDAR/YDLidar-SDK.git
-#   cd YDLidar-SDK
-#   pip install . --break-system-packages
-#
-# Confirm it worked:
-#   python3 -c "import ydlidar; print('YDLidar OK')"
+#   cd YDLidar-SDK && mkdir build && cd build && cmake .. && make
+#   cd .. && pip install . --break-system-packages
 
 # ------------------------------------------------------------
-#  ARDUINO FIRMWARE
+#  UDEV TARGET RULES (/etc/udev/rules.d/99-pulse.rules)
 # ------------------------------------------------------------
-# The Arduino needs its firmware flashed before the Pi can
-# control the motors. Open the Arduino IDE, load the file at
-# motorControl_Arduino/motorControl_Arduino.ino, and upload
-# it to the Arduino Mega.
-#
-# After flashing, confirm the Pi sees it:
-#   ls /dev/ttyACM*
-#
-# You should see /dev/ttyACM0 or similar.
-
-# ------------------------------------------------------------
-#  UDEV RULES  (stable device names across reboots)
-# ------------------------------------------------------------
-# Without udev rules, the LiDAR and Arduino can end up on
-# different ports every time the Pi restarts, and the code
-# won't find them. Set up symlinks so they always appear at
-# /dev/lidar and /dev/arduino no matter what order they boot.
-#
-# Create the rules file:
-#   sudo nano /etc/udev/rules.d/99-pulse.rules
-#
-# Add these two lines (update idVendor and idProduct to match
-# your specific hardware — run lsusb to find them):
+# Add these lines to ensure persistent device names across boots:
 #   SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", SYMLINK+="lidar"
 #   SUBSYSTEM=="tty", ATTRS{idVendor}=="2341", ATTRS{idProduct}=="0042", SYMLINK+="arduino"
 #
-# Reload the rules:
+# Reload udev system paths:
 #   sudo udevadm control --reload-rules && sudo udevadm trigger
-
-# ------------------------------------------------------------
-#  USB HEADSET CHECK
-# ------------------------------------------------------------
-# The Pi uses two separate audio systems and the headset needs
-# to appear in both. Before running client.py, confirm:
-#
-# Speaker side (ALSA):
-#   aplay -l
-#   Should show USB Composite Device under playback devices.
-#
-# Microphone side (ALSA):
-#   arecord -l
-#   Should show USB Composite Device under capture devices.
-#
-# If either is missing, unplug and replug the headset and
-# check again. client.py will also print a full PortAudio
-# device scan on startup so you can see exactly what it found.
-
-# ------------------------------------------------------------
-#  STANDARD LIBRARY — already in Python, nothing to install
-# ------------------------------------------------------------
-# threading, time, json, os, subprocess, tempfile, re, datetime
