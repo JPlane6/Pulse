@@ -6,7 +6,7 @@ AF_DCMotor motor2(3); // Back Left (M3)
 AF_DCMotor motor3(2); // Front Left (M2)
 AF_DCMotor motor4(1); // Front Right (M1)
 
-uint8_t turnSpeed = 255;  // Global speed used for turns (0-255)
+uint8_t turnSpeed = 150;  // Global speed used for turns (0-255)
 
 // State machine states
 enum State { IDLE, RAMPING_UP, RUNNING, RAMPING_DOWN };

@@ -17,9 +17,8 @@ import scipy.signal as signal
 SERVER_URL    = "http://192.168.0.157:5001"
 MAX_QUESTIONS = 6
 SAMPLERATE    = 48000
+LISTEN_SEC    = 6
 
-# Keyword matched against aplay/arecord -l output AND PortAudio device names.
-# Your headset shows as "USB Composite Device" — "USB" catches it.
 AUDIO_DEVICE_KEYWORD = "USB"
 
 PIPER_MODEL = "/home/ayushs0604/Pulse/en_US-amy-medium.onnx"
@@ -36,11 +35,6 @@ os.makedirs(LOG_DIR, exist_ok=True)
 # ═══════════════════════════════════════════════════════════════════
 
 def find_alsa_device():
-    """
-    Scan aplay -l for a USB audio playback device.
-    Returns ALSA string like 'plughw:2,0' (used by aplay for TTS output).
-    Returns None if not found.
-    """
     try:
         result = subprocess.run(["aplay", "-l"], capture_output=True, text=True, timeout=5)
         for line in result.stdout.splitlines():
@@ -58,15 +52,6 @@ def find_alsa_device():
 
 
 def find_portaudio_input_device():
-    """
-    Find USB mic index in PortAudio (what sounddevice actually uses).
-
-    sounddevice does NOT accept ALSA 'plughw:X,0' strings — it needs a
-    PortAudio integer device index. We scan sd.query_devices() for a device
-    whose name contains AUDIO_DEVICE_KEYWORD AND has at least 1 input channel.
-
-    Returns integer index, or None if not found.
-    """
     devices = sd.query_devices()
     print("[audio] PortAudio device scan:")
     for i, dev in enumerate(devices):
@@ -83,7 +68,6 @@ def find_portaudio_input_device():
 
 
 def check_mic_present():
-    """Fast ALSA-level check: is a USB capture device registered at all?"""
     try:
         result = subprocess.run(["arecord", "-l"], capture_output=True, text=True, timeout=5)
         for line in result.stdout.splitlines():
@@ -102,11 +86,6 @@ def check_mic_present():
 # ═══════════════════════════════════════════════════════════════════
 
 def check_server():
-    """
-    Ping the server's /ping endpoint before starting the session.
-    Returns True if reachable, False otherwise.
-    Times out after 5 seconds so the robot doesn't hang.
-    """
     try:
         r = requests.get(f"{SERVER_URL}/ping", timeout=5)
         if r.status_code == 200:
@@ -144,7 +123,7 @@ def get_patient_name(config):
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  TEXT TO SPEECH  (ALSA string — aplay handles it fine)
+#  TEXT TO SPEECH
 # ═══════════════════════════════════════════════════════════════════
 
 def speak(text, alsa_device):
@@ -173,14 +152,10 @@ def speak(text, alsa_device):
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  AUDIO RECORDING  (PortAudio integer index — sounddevice needs this)
+#  AUDIO RECORDING
 # ═══════════════════════════════════════════════════════════════════
 
 def record(duration, pa_device_index):
-    """
-    Record `duration` seconds. pa_device_index is an integer from
-    find_portaudio_input_device(). Returns 16kHz WAV bytes, or b'' on failure.
-    """
     print(f"[mic] Recording {duration}s (PortAudio index={pa_device_index})...")
     try:
         audio = sd.rec(
@@ -250,7 +225,6 @@ def check_urgent(history):
 # ═══════════════════════════════════════════════════════════════════
 
 def show_error_on_lcd(lcd, line2, line3):
-    """Generic full-screen error display."""
     if lcd is None:
         return
     lcd.clear()
@@ -266,36 +240,37 @@ def show_error_on_lcd(lcd, line2, line3):
 
 def show_status_on_lcd(lcd, status, flagged_urgent):
     """
-    Full-screen triage result. Uses all 4 rows — no distances.
-
-    Row 0: == TRIAGE STATUS ==
-    Row 1: (blank spacer)
-    Row 2: >>  !! URGENT !!  <<  /  >>    MONITOR    <<  /  >>    STABLE    <<
-    Row 3: !! NURSE ALERTED !!   /  Assessment complete
+    Display final triage result on LCD if available,
+    then hold forever — navigation will not resume.
     """
-    if lcd is None:
-        return
-    lcd.clear()
-    lcd.cursor_pos = (0, 0)
-    lcd.write_string("== TRIAGE STATUS ==".ljust(20))
-    lcd.cursor_pos = (1, 0)
-    lcd.write_string("".ljust(20))
-    lcd.cursor_pos = (2, 0)
-    if status == "URGENT":
-        lcd.write_string(">>  !! URGENT !!  <<".ljust(20)[:20])
-    elif status == "MONITOR":
-        lcd.write_string(">>    MONITOR     <<".ljust(20)[:20])
-    else:
-        lcd.write_string(">>    STABLE      <<".ljust(20)[:20])
-    lcd.cursor_pos = (3, 0)
-    if flagged_urgent:
-        lcd.write_string("!! NURSE ALERTED !!".ljust(20)[:20])
-    else:
-        lcd.write_string("Assessment complete".ljust(20)[:20])
+    if lcd is not None:
+        lcd.clear()
+        lcd.cursor_pos = (0, 0)
+        lcd.write_string("== TRIAGE RESULT ==".ljust(20))
+        lcd.cursor_pos = (1, 0)
+        lcd.write_string("".ljust(20))
+        lcd.cursor_pos = (2, 0)
+        if status == "URGENT":
+            lcd.write_string(">>  !! URGENT !!  <<".ljust(20)[:20])
+        elif status == "MONITOR":
+            lcd.write_string(">>    MONITOR     <<".ljust(20)[:20])
+        else:
+            lcd.write_string(">>    STABLE      <<".ljust(20)[:20])
+        lcd.cursor_pos = (3, 0)
+        if flagged_urgent:
+            lcd.write_string("!! NURSE ALERTED !!".ljust(20)[:20])
+        else:
+            lcd.write_string("Assessment complete".ljust(20)[:20])
+
+    print(f"[lcd] Final status: {status} | urgent={flagged_urgent}")
+    print("[lcd] Holding — navigation will not resume.")
+
+    # Always runs — blocks client.py forever regardless of LCD
+    while True:
+        time.sleep(60)
 
 
 def init_lcd():
-    """Try to connect to LCD. Returns lcd object or None."""
     try:
         from RPLCD.i2c import CharLCD
         lcd = CharLCD("PCF8574", 0x27, cols=20, rows=4)
@@ -317,7 +292,6 @@ def save_log(session_dir, session_record):
         json.dump(session_record, f, indent=2)
     print(f"[log] Session saved to {session_dir}/log.json")
 
-    # Handle missing or corrupt/empty patientINFO.json gracefully
     all_records = []
     if os.path.exists(PATIENT_INFO_PATH):
         try:
@@ -343,13 +317,13 @@ def save_log(session_dir, session_record):
 
 def main():
 
-    # ── 1. ALSA playback device (speaker / TTS) ─────────────────
+    # ── 1. ALSA playback device ──────────────────────────────────
     alsa_device = find_alsa_device()
     if alsa_device is None:
         print("[main] FATAL: No USB speaker found — cannot speak.")
         return
 
-    # ── 2. LCD (optional — robot continues without it) ───────────
+    # ── 2. LCD ───────────────────────────────────────────────────
     lcd = init_lcd()
     if lcd:
         lcd.cursor_pos = (0, 0)
@@ -366,7 +340,7 @@ def main():
         )
         return
 
-    # ── 4. PortAudio input index (sounddevice level) ─────────────
+    # ── 4. PortAudio input index ─────────────────────────────────
     pa_input_index = find_portaudio_input_device()
     if pa_input_index is None:
         print("[main] Mic found by ALSA but not by PortAudio.")
@@ -378,12 +352,12 @@ def main():
         )
         return
 
-    # ── 5. Server connectivity check ─────────────────────────────
+    # ── 5. Server check ──────────────────────────────────────────
     if not check_server():
         print("[main] Server unreachable.")
         show_error_on_lcd(lcd, "SERVER OFFLINE", "Check Laptop")
         speak(
-            "I cannot connect to my brain right now "
+            "I cannot connect to my brain right now. "
             "Let me visit the doctor!",
             alsa_device
         )
@@ -422,9 +396,9 @@ def main():
     # ── 10. Mandatory first question ─────────────────────────────
     first_q = "On a scale of 1 to 10, how would you rate your pain right now?"
     speak(first_q, alsa_device)
-    time.sleep(1)
+    time.sleep(0.5)
 
-    answer, answer_status = transcribe(record(duration=12, pa_device_index=pa_input_index))
+    answer, answer_status = transcribe(record(duration=LISTEN_SEC, pa_device_index=pa_input_index))
     history.append({"q": first_q, "a": answer, "status": answer_status})
     if priority[answer_status] > priority[status]:
         status = answer_status
@@ -439,9 +413,9 @@ def main():
             break
 
         speak(next_q, alsa_device)
-        time.sleep(1)
+        time.sleep(0.5)
 
-        answer, answer_status = transcribe(record(duration=12, pa_device_index=pa_input_index))
+        answer, answer_status = transcribe(record(duration=LISTEN_SEC, pa_device_index=pa_input_index))
         history.append({"q": next_q, "a": answer, "status": answer_status})
         if priority[answer_status] > priority[status]:
             status = answer_status
@@ -466,10 +440,7 @@ def main():
 
     print(f"\n[final] Status: {status} | Urgent: {flagged_urgent}")
 
-    # ── 13. Show final status on LCD (full screen) ───────────────
-    show_status_on_lcd(lcd, status, flagged_urgent)
-
-    # ── 14. Save logs ────────────────────────────────────────────
+    # ── 13. Save logs ────────────────────────────────────────────
     save_log(
         session_dir,
         {
@@ -486,6 +457,9 @@ def main():
             "assessment": history
         }
     )
+
+    # ── 14. Show final status on LCD and hold forever ────────────
+    show_status_on_lcd(lcd, status, flagged_urgent)
 
 
 # ═══════════════════════════════════════════════════════════════════

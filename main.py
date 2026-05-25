@@ -22,8 +22,8 @@ OBSTACLE_THRESHOLD_CM   = 50
 OPENING_INCREASE_CM     = 12
 
 # --- Turn-and-enter constants (UNCHANGED) ---
-TURN_DURATION_SEC       = 1
-ENTER_SPEED             = 155
+TURN_DURATION_SEC       = 1  # Adjust as needed for a 90° turn at your speed
+ENTER_SPEED             = 100
 ENTER_DURATION_SEC      = 1
 ENTER_ROOM_THRESHOLD_CM = 45
 
@@ -96,7 +96,7 @@ def move_forward_until_obstacle(laser, lcd=None, threshold_cm=25, speed=ENTER_SP
 
 def enter_room(side, laser, lcd=None):
     """
-    Stop, turn 90° toward the opening, drive into the room until threshold.
+    Stop, turn 90° toward the opening
     side: 'L' or 'R'
     """
     print(f"[enter_room] Turning {side} into opening...")
@@ -107,12 +107,6 @@ def enter_room(side, laser, lcd=None):
     motors.go()
     motors.turn(side, TURN_DURATION_SEC)
 
-    print(f"[enter_room] Driving into room...")
-    if lcd:
-        lcd.cursor_pos = (3, 0)
-        lcd.write_string("ENTERING ROOM...".ljust(20)[:20])
-
-    motors.moveUntilThreshold('F', ENTER_ROOM_THRESHOLD_CM, laser, ENTER_SPEED)
 
     print(f"[enter_room] Entered room.")
 
