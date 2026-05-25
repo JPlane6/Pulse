@@ -1,6 +1,7 @@
 import sounddevice as sd
 import scipy.io.wavfile as wav
 import requests
+from requests.exceptions import Timeout, ConnectionError  # Safer network handling
 import tempfile
 import os
 import re
@@ -8,11 +9,19 @@ import time
 import subprocess
 import json
 import threading
+import queue  # Thread-safe audio buffering for streaming playback
 from datetime import datetime
 import scipy.signal as signal
 import numpy as np
 import torch
 from silero_vad import load_silero_vad, VADIterator
+
+# ═══════════════════════════════════════════════════════════════════
+#  CRITICAL PI PERFORMANCE TUNING
+# ═══════════════════════════════════════════════════════════════════
+# Hard-cap PyTorch to single-threading to prevent core exhaustion and audio stutter
+torch.set_num_threads(1)
+torch.set_num_interop_threads(1)
 
 # ═══════════════════════════════════════════════════════════════════
 #  TOP-LEVEL FEATURES & HARDWARE CONFIGURATION
@@ -24,10 +33,10 @@ SAMPLERATE       = 16000          # Internal rate needed by Silero/Whisper
 AUDIO_DEVICE_KEYWORD = "USB"      # Identifies your target USB mic & speaker
 PIPER_MODEL      = "/home/ayushs0604/Pulse/en_US-amy-medium.onnx"
 
-# --- Feature 3: Barge-In Interruption Toggle & Tuning ---
+# --- Feature 3: Barge-In Interruption Toggle & COMBO HARDWARE Tuning ---
 BARGE_IN_ENABLED     = True       # Set to False to disable user interrupting the robot
-VAD_THRESHOLD        = 0.75       # Stricter confidence filter (0.0 to 1.0) to prevent false hits
-BARGE_IN_IGNORE_SECS = 0.4        # Time buffer to ignore initial speaker pop/echo sounds
+VAD_THRESHOLD        = 0.90       # Sharp confidence filter
+BARGE_IN_IGNORE_SECS = 6.0        # STRETCHED LOCKOUT: Blind the mic for 6 seconds to clear introductory hardware echo loops
 
 # --- Feature 4: RGB Status LED Pin Layout (GPIO Line Offsets) ---
 LED_RED_PIN      = 17             # Lights up for URGENT status
@@ -60,7 +69,7 @@ print("[vad] Loading Silero VAD framework...")
 vad_model = load_silero_vad()
 print("[vad] Silero VAD framework loaded.")
 
-# Native initialization of GPIO lines for Pi 5 using gpiod
+# Native initialization of GPIO lines for Pi 5 using dynamically scanned gpiod
 GPIO_AVAILABLE = False
 RED_LINE = None
 GREEN_LINE = None
@@ -68,8 +77,13 @@ BLUE_LINE = None
 
 try:
     import gpiod
-    # Raspberry Pi 5 core GPIO hardware mapping uses gpiochip4
-    LED_CHIP = gpiod.Chip('gpiochip4')
+    
+    # Kernel Update Fix: Dynamically detect if your Pi 5 is using gpiochip0 or gpiochip4
+    target_chip = 'gpiochip0'
+    if not os.path.exists('/dev/gpiochip0') and os.path.exists('/dev/gpiochip4'):
+        target_chip = 'gpiochip4'
+        
+    LED_CHIP = gpiod.Chip(target_chip)
     
     RED_LINE = LED_CHIP.get_line(LED_RED_PIN)
     GREEN_LINE = LED_CHIP.get_line(LED_GREEN_PIN)
@@ -84,7 +98,7 @@ try:
     BLUE_LINE.set_value(0)
     
     GPIO_AVAILABLE = True
-    print("[gpio] Raspberry Pi 5 gpiod Lines successfully initialized.")
+    print(f"[gpio] Raspberry Pi 5 gpiod successfully linked via hardware target: {target_chip}")
 except Exception as e:
     print(f"[gpio] Raspberry Pi 5 gpiod setup bypassed ({e}). Operating in text simulation mode safely.")
 
@@ -100,7 +114,6 @@ def set_status_led(status_type):
         return
 
     try:
-        # Reset all channels low
         RED_LINE.set_value(0)
         GREEN_LINE.set_value(0)
         BLUE_LINE.set_value(0)
@@ -149,7 +162,7 @@ def run_microphone_calibration(pa_device_index):
 # ═══════════════════════════════════════════════════════════════════
 
 def monitor_barge_in(aplay_process, piper_process, pa_device_index):
-    """Background monitoring thread with echo suppression and tuned VAD thresholds."""
+    """Background monitoring thread tuned specifically to suppress cross-talk pop on combo USB devices."""
     start_time = time.time()
     try:
         device_info = sd.query_devices(pa_device_index, 'input')
@@ -164,11 +177,13 @@ def monitor_barge_in(aplay_process, piper_process, pa_device_index):
             while aplay_process.poll() is None:
                 frame, _ = stream.read(hw_blocksize)
                 
-                # Suppress checking during the exact initial fraction of a second to prevent speaker click triggers
+                # COMBO PROTECTION: Extended time window to completely filter device loop-back noise
                 if time.time() - start_time < BARGE_IN_IGNORE_SECS:
                     continue
-                    
-                f32_frame = frame.flatten().astype(np.float32) / 32768.0
+                
+                frame_fixed = np.ascontiguousarray(frame, dtype=np.int16)
+                f32_frame = frame_fixed.flatten().astype(np.float32) / 32768.0
+                
                 target_num_samples = int(len(f32_frame) * SAMPLERATE / native_sr)
                 resampled_f32 = signal.resample(f32_frame, target_num_samples)
                 tensor = torch.from_numpy(resampled_f32).float()
@@ -295,9 +310,12 @@ def record(pa_device_index, silence_duration=VAD_SILENCE_DURATION, max_duration=
         with sd.InputStream(samplerate=native_sr, channels=1, dtype='int16', device=pa_device_index, blocksize=hw_blocksize) as stream:
             for _ in range(max_frames):
                 frame, _ = stream.read(hw_blocksize)
-                frames.append(frame.copy())
+                
+                # MEMORY OPTIMIZATION: Ensure fast, layout-contiguous NumPy allocation
+                frame_contiguous = np.ascontiguousarray(frame, dtype=np.int16)
+                frames.append(frame_contiguous.copy())
 
-                f32_frame = frame.flatten().astype(np.float32) / 32768.0
+                f32_frame = frame_contiguous.flatten().astype(np.float32) / 32768.0
                 target_num_samples = int(len(f32_frame) * SAMPLERATE / native_sr)
                 resampled_f32 = signal.resample(f32_frame, target_num_samples)
                 tensor = torch.from_numpy(resampled_f32).float()
@@ -392,7 +410,7 @@ def get_next_question_streaming(history, alsa_device, pa_device_index=None):
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  SERVER UTILITY CALL TRANSFERS
+#  SERVER UTILITY CALL TRANSFERS WITH SAFER HANDLING
 # ═══════════════════════════════════════════════════════════════════
 
 def transcribe(audio_bytes):
@@ -405,8 +423,11 @@ def transcribe(audio_bytes):
         res = r.json()
         print(f"[stt] Server Text Output: '{res['text']}'")
         return res["text"], res["status"]
+    except (Timeout, ConnectionError) as net_err:
+        print(f"[stt] NETWORK ERROR during transcription fallback: {net_err}")
+        return "", "STABLE"
     except Exception as e:
-        print(f"[stt] Remote transcription dropped: {e}")
+        print(f"[stt] General remote transcription failure dropped: {e}")
         return "", "STABLE"
 
 def check_urgent(history):
@@ -426,7 +447,6 @@ def confirm_answer(answer_text, alsa_device, pa_device_index):
     current_answer = answer_text
 
     for attempt in range(MAX_CONFIRM_RETRIES + 1):
-        # Local Ambiguity Filter: Catch empty loops or short static noise before sending to LLM
         if not current_answer.strip() or len(current_answer.strip()) < 2:
             print("[confirm-local] Caught empty or ambiguous string entry. Requesting clarification.")
             speak("I didn't quite catch that. Could you please repeat your response clearly?", alsa_device, pa_device_index)
@@ -531,7 +551,6 @@ def main():
         speak("I cannot hear you right now. My microphone is disconnected.", alsa_device)
         return
 
-    # Feature 5 Run: Core micro-mixer calibration pass
     if not run_microphone_calibration(pa_input_index):
         show_error_on_lcd(lcd, "MIC MUTED / ERROR", "Run Mixer Checks")
         speak("My microphone is muted or failing diagnostic checks.", alsa_device)
@@ -554,7 +573,6 @@ def main():
         lcd.clear()
         lcd.write_string("PULSE READY")
 
-    # Establish baseline healthy status LED on run start
     set_status_led("STABLE")
 
     speak(f"Hello {patient_name}! I am your nurse assistant robot. Let's check in on you.", alsa_device, pa_input_index)
@@ -576,10 +594,12 @@ def main():
     set_status_led(status)
     print(f"[status-update] Current Patient Status Evaluation: {status}")
 
+    # Main Conversation Loop (Can break out early at any point)
     for i in range(MAX_QUESTIONS - 1):
         print(f"\n--- Follow-up Question Cycle {i+1} of {MAX_QUESTIONS-1} ---")
         next_q = get_next_question_streaming(history, alsa_device, pa_input_index)
         
+        # EARLY EXIT GROUND RULE 1: Server drops explicit DONE phrase
         if next_q.strip().upper() == "DONE":
             print("[main] LLM invoked 'DONE' signal. Ending session loop early.")
             break
@@ -594,14 +614,23 @@ def main():
         set_status_led(status)
         print(f"[status-update] Current Patient Status Evaluation: {status}")
 
+        # EARLY EXIT GROUND RULE 2: If status jumps straight to URGENT, terminate the loop immediately
+        if status == "URGENT":
+            print("[main] Critical status thresholds breached. Terminating questions early to trigger nurse alert.")
+            break
+
     print("\n--- Finalizing Triage Decisions ---")
-    flagged_urgent = check_urgent(history)
+    flagged_urgent = check_urgent(history) or (status == "URGENT")
+    
     if flagged_urgent:
         status = "URGENT"
         set_status_led("URGENT")
         speak(f"Based on your responses {patient_name}, I am alerting a nurse immediately.", alsa_device, pa_input_index)
     else:
         speak(f"Thank you {patient_name}. Your assessment is complete.", alsa_device, pa_input_index)
+
+    # UNCONDITIONAL GLOBAL SIGN-OFF
+    speak("Thank you for your time. Feel better soon.", alsa_device, pa_input_index)
 
     show_status_on_lcd(lcd, status, flagged_urgent)
     save_log(session_dir, {
@@ -614,7 +643,6 @@ if __name__ == "__main__":
     try:
         main()
     finally:
-        # Clear allocated lines down to absolute safe low states on application kill
         if GPIO_AVAILABLE:
             try:
                 RED_LINE.set_value(0)

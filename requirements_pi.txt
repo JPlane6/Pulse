@@ -44,7 +44,7 @@ silero-vad
 # Dynamic silence threshold iterator to eliminate fixed audio recording caps.
 
 gpiod
-# allows Pi to use GPIO pins to run the LEDs
+# Allows Pi to use GPIO pins to run the status LEDs natively.
 
 # ============================================================
 #  CANNOT BE INSTALLED WITH PIP
@@ -56,7 +56,7 @@ gpiod
 # ------------------------------------------------------------
 # Run these terminal operations to configure base image tools:
 #   sudo apt-get update
-#   sudo apt-get install -y i2c-tools python3-dev cmake swig libgfortran5 libatlas-base-dev
+#   sudo apt-get install -y i2c-tools python3-dev cmake swig libgfortran5 libatlas-base-dev libgpiod-dev aplay arecord
 
 # ------------------------------------------------------------
 #  I2C BUS CONFIGURATION (LCD Screen)
