@@ -2,7 +2,8 @@ import whisper
 import requests
 import tempfile
 import os
-from flask import Flask, request, jsonify
+import json
+from flask import Flask, request, jsonify, Response
 
 app = Flask(__name__)
 
@@ -12,6 +13,9 @@ app = Flask(__name__)
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
 TEXT_MODEL = "phi3:mini"
+
+# Port the Pi connects to
+SERVER_PORT = 5001
 
 URGENT_KEYWORDS  = ["severe", "chest", "can't breathe", "cannot breathe",
                     "help", "emergency", "10", "worst", "unconscious", "dying"]
@@ -45,11 +49,7 @@ def assess(text):
 
 @app.route("/ping", methods=["GET"])
 def ping():
-    """
-    Simple health check endpoint.
-    The Pi calls this before starting any session to confirm
-    the server is up and reachable. Returns 200 + {"status": "ok"}.
-    """
+    """Simple health check — Pi calls this before starting any session."""
     print("[ping] Pi connected.")
     return jsonify({"status": "ok"})
 
@@ -83,15 +83,21 @@ def transcribe():
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  ROUTE: Generate next triage question
+#  ROUTE: Generate next triage question — STREAMING
 # ═══════════════════════════════════════════════════════════════════
 
 @app.route("/next_question", methods=["POST"])
 def next_question():
     """
     Receive conversation history from the Pi, ask Phi3:mini for
-    the single best follow-up question (or DONE if enough info gathered).
-    First line only is returned to guard against model rambling.
+    the single best follow-up question.
+
+    Streams tokens back to the Pi as they are generated so the Pi
+    can feed them to Piper TTS immediately — patient hears the
+    question starting within ~1s instead of waiting for full generation.
+
+    Returns plain text stream (not JSON).
+    First line safeguard still applies on the Pi side.
     """
     try:
         history = request.get_json()["history"]
@@ -111,20 +117,33 @@ def next_question():
             "Next question (or DONE):"
         )
 
-        r = requests.post(
-            OLLAMA_URL,
-            json={"model": TEXT_MODEL, "prompt": prompt, "stream": False},
-            timeout=60
-        )
-        # First line only — guards against Phi3 rambling after the question
-        question = r.json()["response"].strip().split("\n")[0]
+        def generate():
+            """Generator that yields tokens from Ollama as they arrive."""
+            try:
+                r = requests.post(
+                    OLLAMA_URL,
+                    json={"model": TEXT_MODEL, "prompt": prompt, "stream": True},
+                    stream=True,
+                    timeout=60
+                )
+                for line in r.iter_lines():
+                    if line:
+                        chunk = json.loads(line)
+                        token = chunk.get("response", "")
+                        done  = chunk.get("done", False)
+                        if token:
+                            yield token
+                        if done:
+                            break
+            except Exception as e:
+                print(f"[next_question] Stream error: {e}")
+                yield "DONE"
 
-        print(f"[next_question] {question}")
-        return jsonify({"question": question})
+        return Response(generate(), mimetype="text/plain")
 
     except Exception as e:
         print(f"[next_question] Error: {e}")
-        return jsonify({"question": "DONE"})
+        return Response("DONE", mimetype="text/plain")
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -136,7 +155,6 @@ def flag_urgent():
     """
     Receive full conversation history, ask Phi3:mini to make a
     final YES/NO call on whether the patient should be flagged URGENT.
-    More reliable than keyword matching alone for edge cases.
     """
     try:
         history = request.get_json()["history"]
@@ -157,7 +175,6 @@ def flag_urgent():
             json={"model": TEXT_MODEL, "prompt": prompt, "stream": False},
             timeout=60
         )
-        # First line only — guards against extra text after YES/NO
         result  = r.json()["response"].strip().upper().split("\n")[0]
         flagged = "YES" in result
 
@@ -174,5 +191,5 @@ def flag_urgent():
 # ═══════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    print("[server] Starting on 0.0.0.0:5000")
-    app.run(host="0.0.0.0", port=5001, debug=False)
+    print(f"[server] Starting on 0.0.0.0:{SERVER_PORT}")
+    app.run(host="0.0.0.0", port=SERVER_PORT, debug=False)

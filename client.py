@@ -9,19 +9,38 @@ import subprocess
 import json
 from datetime import datetime
 import scipy.signal as signal
+import numpy as np
+import torch
+from silero_vad import load_silero_vad, VADIterator
 
 # ═══════════════════════════════════════════════════════════════════
-#  CONFIG
+#  CONFIG — edit these to tune behaviour without touching logic
 # ═══════════════════════════════════════════════════════════════════
 
 SERVER_URL    = "http://192.168.0.157:5001"
 MAX_QUESTIONS = 6
-SAMPLERATE    = 48000
-LISTEN_SEC    = 6
+SAMPLERATE    = 16000          # Record at 16kHz natively — Silero + Whisper both want this
 
-AUDIO_DEVICE_KEYWORD = "USB"
+AUDIO_DEVICE_KEYWORD = "USB"   # Keyword matched against aplay/arecord/PortAudio device names
 
 PIPER_MODEL = "/home/ayushs0604/Pulse/en_US-amy-medium.onnx"
+
+# --- Silero VAD tuning ---
+VAD_THRESHOLD         = 0.5    # Speech confidence cutoff (0.0-1.0). Raise if noisy room, lower if clipping speech
+VAD_SILENCE_DURATION  = 1.5   # Seconds of silence before recording stops
+VAD_MAX_DURATION      = 15    # Hard cap in seconds — robot won't wait longer than this
+VAD_FRAME_SAMPLES     = 512   # Silero expects 512 samples at 16kHz — do not change
+
+# --- Confirmation loop tuning ---
+CONFIRM_SILENCE_DURATION = 0.8  # Shorter silence buffer for yes/no answers
+CONFIRM_MAX_DURATION     = 5    # Hard cap for yes/no listen
+YES_KEYWORDS = ["yes", "yeah", "yep", "correct", "right", "sure", "mhm", "yup"]
+NO_KEYWORDS  = ["no", "nope", "nah", "wrong", "incorrect", "not", "didn't", "that's not"]
+MAX_CONFIRM_RETRIES = 2         # How many times to re-record before giving up and accepting anyway
+
+# --- Streaming TTS tuning ---
+STREAM_SENTENCE_ENDINGS = [".", "?", "!"]   # Chars that trigger Piper to speak the buffered chunk
+STREAM_MIN_CHUNK_WORDS  = 3                 # Don't send to Piper until at least this many words buffered
 
 LOG_DIR           = os.path.join(os.path.dirname(os.path.abspath(__file__)), "modules", "logs")
 PATIENT_INFO_PATH = os.path.join(LOG_DIR, "patientINFO.json")
@@ -31,10 +50,23 @@ os.makedirs(LOG_DIR, exist_ok=True)
 
 
 # ═══════════════════════════════════════════════════════════════════
+#  SILERO VAD — load once at startup
+# ═══════════════════════════════════════════════════════════════════
+
+print("[vad] Loading Silero VAD model...")
+vad_model = load_silero_vad()
+print("[vad] Silero VAD ready.")
+
+
+# ═══════════════════════════════════════════════════════════════════
 #  AUDIO DEVICE AUTO-DETECTION
 # ═══════════════════════════════════════════════════════════════════
 
 def find_alsa_device():
+    """
+    Scan aplay -l for a USB audio playback device.
+    Returns ALSA string like 'plughw:2,0' or None if not found.
+    """
     try:
         result = subprocess.run(["aplay", "-l"], capture_output=True, text=True, timeout=5)
         for line in result.stdout.splitlines():
@@ -52,6 +84,10 @@ def find_alsa_device():
 
 
 def find_portaudio_input_device():
+    """
+    Find USB mic index in PortAudio (integer index sounddevice needs).
+    Returns integer index or None if not found.
+    """
     devices = sd.query_devices()
     print("[audio] PortAudio device scan:")
     for i, dev in enumerate(devices):
@@ -68,6 +104,7 @@ def find_portaudio_input_device():
 
 
 def check_mic_present():
+    """Fast ALSA-level check: is a USB capture device registered at all?"""
     try:
         result = subprocess.run(["arecord", "-l"], capture_output=True, text=True, timeout=5)
         for line in result.stdout.splitlines():
@@ -91,9 +128,8 @@ def check_server():
         if r.status_code == 200:
             print(f"[server] Connected to {SERVER_URL}")
             return True
-        else:
-            print(f"[server] Unexpected status {r.status_code} from {SERVER_URL}")
-            return False
+        print(f"[server] Unexpected status {r.status_code}")
+        return False
     except Exception as e:
         print(f"[server] Cannot reach {SERVER_URL}: {e}")
         return False
@@ -127,6 +163,7 @@ def get_patient_name(config):
 # ═══════════════════════════════════════════════════════════════════
 
 def speak(text, alsa_device):
+    """Speak a full string — blocks until done."""
     print(f"[tts] {text}")
     try:
         piper = subprocess.Popen(
@@ -139,41 +176,99 @@ def speak(text, alsa_device):
         )
         piper.stdin.write(text.encode("utf-8"))
         piper.stdin.close()
-        aplay_rc = aplay.wait()
-        piper_rc = piper.wait()
-        if piper_rc != 0:
-            print(f"[tts] Piper error: {piper.stderr.read().decode()}")
-        if aplay_rc != 0:
-            print(f"[tts] Aplay error: {aplay.stderr.read().decode()}")
-        if piper_rc == 0 and aplay_rc == 0:
-            print("[tts] Done.")
+        aplay.wait()
+        piper.wait()
     except Exception as e:
         print(f"[tts] Error: {e}")
 
 
+def speak_chunk(chunk, alsa_device):
+    """
+    Speak a single text chunk — used by streaming to play sentence-by-sentence.
+    Same as speak() but silences piper errors to keep streaming output clean.
+    """
+    if not chunk.strip():
+        return
+    try:
+        piper = subprocess.Popen(
+            ["piper", "--model", PIPER_MODEL, "--output_raw"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+        )
+        aplay = subprocess.Popen(
+            ["aplay", "-D", alsa_device, "-r", "22050", "-f", "S16_LE", "-c", "1"],
+            stdin=piper.stdout, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        piper.stdin.write(chunk.strip().encode("utf-8"))
+        piper.stdin.close()
+        aplay.wait()
+        piper.wait()
+    except Exception as e:
+        print(f"[tts] Chunk error: {e}")
+
+
 # ═══════════════════════════════════════════════════════════════════
-#  AUDIO RECORDING
+#  AUDIO RECORDING — Silero VAD
 # ═══════════════════════════════════════════════════════════════════
 
-def record(duration, pa_device_index):
-    print(f"[mic] Recording {duration}s (PortAudio index={pa_device_index})...")
+def record(pa_device_index, silence_duration=VAD_SILENCE_DURATION, max_duration=VAD_MAX_DURATION):
+    """
+    Record using Silero VAD — stops automatically when patient goes quiet.
+    silence_duration: seconds of silence before stopping
+    max_duration: hard cap so robot never hangs
+    """
+    vad_iterator = VADIterator(
+        vad_model,
+        threshold=VAD_THRESHOLD,
+        sampling_rate=SAMPLERATE,
+        min_silence_duration_ms=int(silence_duration * 1000),
+        speech_pad_ms=100
+    )
+
+    silence_frames_needed = int(silence_duration * SAMPLERATE / VAD_FRAME_SAMPLES)
+    max_frames            = int(max_duration * SAMPLERATE / VAD_FRAME_SAMPLES)
+
+    frames          = []
+    silent_frames   = 0
+    started_speaking = False
+
+    print(f"[mic] Listening with Silero VAD (index={pa_device_index})...")
+
     try:
-        audio = sd.rec(
-            int(duration * SAMPLERATE),
+        with sd.InputStream(
             samplerate=SAMPLERATE,
             channels=1,
-            dtype='float32',
-            device=pa_device_index
-        )
-        sd.wait()
+            dtype='int16',
+            device=pa_device_index,
+            blocksize=VAD_FRAME_SAMPLES
+        ) as stream:
+            for _ in range(max_frames):
+                frame, _ = stream.read(VAD_FRAME_SAMPLES)
+                frames.append(frame.copy())
+
+                # Convert int16 → float32 tensor for Silero
+                tensor = torch.frombuffer(frame.tobytes(), dtype=torch.int16).float() / 32768.0
+                confidence = vad_model(tensor, SAMPLERATE).item()
+
+                if confidence > VAD_THRESHOLD:
+                    started_speaking = True
+                    silent_frames = 0
+                elif started_speaking:
+                    silent_frames += 1
+                    if silent_frames >= silence_frames_needed:
+                        print(f"[mic] Silence detected — stopping.")
+                        break
+
     except Exception as e:
         print(f"[mic] Recording failed: {e}")
         return b""
 
-    audio_resampled = signal.resample(audio, int(len(audio) * 16000 / SAMPLERATE))
+    if not frames:
+        return b""
+
+    audio = np.concatenate(frames, axis=0)
 
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-        wav.write(f.name, 16000, audio_resampled)
+        wav.write(f.name, SAMPLERATE, audio)
         path = f.name
 
     with open(path, "rb") as f:
@@ -202,12 +297,49 @@ def transcribe(audio_bytes):
         return "", "STABLE"
 
 
-def get_next_question(history):
+def get_next_question_streaming(history, alsa_device):
+    """
+    Stream tokens from server as they arrive.
+    Accumulates into sentence chunks and feeds each to Piper immediately
+    so patient hears the question starting within ~1s of it being generated.
+    Returns the full question string for logging.
+    """
     try:
-        r = requests.post(f"{SERVER_URL}/next_question", json={"history": history}, timeout=60)
-        return r.json()["question"]
+        r = requests.post(
+            f"{SERVER_URL}/next_question",
+            json={"history": history},
+            stream=True,
+            timeout=60
+        )
+
+        full_text   = ""
+        buffer      = ""
+
+        for chunk in r.iter_content(chunk_size=1, decode_unicode=True):
+            if not chunk:
+                continue
+
+            buffer    += chunk
+            full_text += chunk
+
+            # Check if we've hit a sentence boundary and have enough words
+            if any(buffer.rstrip().endswith(end) for end in STREAM_SENTENCE_ENDINGS):
+                word_count = len(buffer.strip().split())
+                if word_count >= STREAM_MIN_CHUNK_WORDS:
+                    print(f"[stream] Speaking chunk: '{buffer.strip()}'")
+                    speak_chunk(buffer, alsa_device)
+                    buffer = ""
+
+        # Speak any remaining buffer (e.g. question didn't end with punctuation)
+        if buffer.strip():
+            speak_chunk(buffer, alsa_device)
+
+        result = full_text.strip().split("\n")[0]  # First line safeguard
+        print(f"[next_question] Full question: '{result}'")
+        return result
+
     except Exception as e:
-        print(f"[question] Failed: {e}")
+        print(f"[question] Streaming failed: {e}")
         return "DONE"
 
 
@@ -218,6 +350,58 @@ def check_urgent(history):
     except Exception as e:
         print(f"[urgent] Failed: {e}")
         return False
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  CONFIRMATION LOOP
+# ═══════════════════════════════════════════════════════════════════
+
+def confirm_answer(answer_text, alsa_device, pa_device_index):
+    """
+    Read back what the robot heard and ask the patient to confirm.
+    Returns the confirmed answer text (re-recorded if patient says no).
+    Gives up and accepts the original after MAX_CONFIRM_RETRIES failed attempts.
+    """
+    current_answer = answer_text
+
+    for attempt in range(MAX_CONFIRM_RETRIES + 1):
+        # Read back what was heard
+        if not current_answer.strip():
+            speak("Sorry, I didn't catch that. Could you please repeat?", alsa_device)
+        else:
+            speak(f"I heard: {current_answer}. Is that correct?", alsa_device)
+
+        # Listen for yes/no
+        audio = record(pa_device_index, silence_duration=CONFIRM_SILENCE_DURATION, max_duration=CONFIRM_MAX_DURATION)
+        response, _ = transcribe(audio)
+        response_lower = response.lower()
+
+        print(f"[confirm] Patient said: '{response_lower}'")
+
+        # Check for yes
+        if any(word in response_lower for word in YES_KEYWORDS):
+            print("[confirm] Confirmed.")
+            return current_answer
+
+        # Check for no
+        if any(word in response_lower for word in NO_KEYWORDS):
+            if attempt < MAX_CONFIRM_RETRIES:
+                speak("Sorry about that. Please say your answer again.", alsa_device)
+                audio = record(pa_device_index)
+                new_answer, _ = transcribe(audio)
+                print(f"[confirm] Re-recorded: '{new_answer}'")
+                current_answer = new_answer
+            else:
+                # Gave up re-trying — accept what we have
+                print("[confirm] Max retries reached — accepting current answer.")
+                speak("Thank you, I'll note that down.", alsa_device)
+                return current_answer
+        else:
+            # Ambiguous response — treat as confirmed and move on
+            print("[confirm] Ambiguous response — treating as confirmed.")
+            return current_answer
+
+    return current_answer
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -239,35 +423,25 @@ def show_error_on_lcd(lcd, line2, line3):
 
 
 def show_status_on_lcd(lcd, status, flagged_urgent):
-    """
-    Display final triage result on LCD if available,
-    then hold forever — navigation will not resume.
-    """
-    if lcd is not None:
-        lcd.clear()
-        lcd.cursor_pos = (0, 0)
-        lcd.write_string("== TRIAGE RESULT ==".ljust(20))
-        lcd.cursor_pos = (1, 0)
-        lcd.write_string("".ljust(20))
-        lcd.cursor_pos = (2, 0)
-        if status == "URGENT":
-            lcd.write_string(">>  !! URGENT !!  <<".ljust(20)[:20])
-        elif status == "MONITOR":
-            lcd.write_string(">>    MONITOR     <<".ljust(20)[:20])
-        else:
-            lcd.write_string(">>    STABLE      <<".ljust(20)[:20])
-        lcd.cursor_pos = (3, 0)
-        if flagged_urgent:
-            lcd.write_string("!! NURSE ALERTED !!".ljust(20)[:20])
-        else:
-            lcd.write_string("Assessment complete".ljust(20)[:20])
-
-    print(f"[lcd] Final status: {status} | urgent={flagged_urgent}")
-    print("[lcd] Holding — navigation will not resume.")
-
-    # Always runs — blocks client.py forever regardless of LCD
-    while True:
-        time.sleep(60)
+    if lcd is None:
+        return
+    lcd.clear()
+    lcd.cursor_pos = (0, 0)
+    lcd.write_string("== TRIAGE STATUS ==".ljust(20))
+    lcd.cursor_pos = (1, 0)
+    lcd.write_string("".ljust(20))
+    lcd.cursor_pos = (2, 0)
+    if status == "URGENT":
+        lcd.write_string(">>  !! URGENT !!  <<".ljust(20)[:20])
+    elif status == "MONITOR":
+        lcd.write_string(">>    MONITOR     <<".ljust(20)[:20])
+    else:
+        lcd.write_string(">>    STABLE      <<".ljust(20)[:20])
+    lcd.cursor_pos = (3, 0)
+    if flagged_urgent:
+        lcd.write_string("!! NURSE ALERTED !!".ljust(20)[:20])
+    else:
+        lcd.write_string("Assessment complete".ljust(20)[:20])
 
 
 def init_lcd():
@@ -323,7 +497,7 @@ def main():
         print("[main] FATAL: No USB speaker found — cannot speak.")
         return
 
-    # ── 2. LCD ───────────────────────────────────────────────────
+    # ── 2. LCD (optional) ────────────────────────────────────────
     lcd = init_lcd()
     if lcd:
         lcd.cursor_pos = (0, 0)
@@ -333,11 +507,7 @@ def main():
     if not check_mic_present():
         print("[main] Mic not detected at ALSA level.")
         show_error_on_lcd(lcd, "MIC NOT FOUND", "Check Hardware")
-        speak(
-            "I cannot hear you right now. I need to go get serviced. "
-            "Please contact the nurse station.",
-            alsa_device
-        )
+        speak("I cannot hear you right now. I need to go get serviced. Please contact the nurse station.", alsa_device)
         return
 
     # ── 4. PortAudio input index ─────────────────────────────────
@@ -345,22 +515,14 @@ def main():
     if pa_input_index is None:
         print("[main] Mic found by ALSA but not by PortAudio.")
         show_error_on_lcd(lcd, "MIC NOT FOUND", "Check Hardware")
-        speak(
-            "I cannot hear you right now. I need to go get serviced. "
-            "Please contact the nurse station.",
-            alsa_device
-        )
+        speak("I cannot hear you right now. I need to go get serviced. Please contact the nurse station.", alsa_device)
         return
 
-    # ── 5. Server check ──────────────────────────────────────────
+    # ── 5. Server connectivity check ─────────────────────────────
     if not check_server():
         print("[main] Server unreachable.")
         show_error_on_lcd(lcd, "SERVER OFFLINE", "Check Laptop")
-        speak(
-            "I cannot connect to my brain right now. "
-            "Let me visit the doctor!",
-            alsa_device
-        )
+        speak("I cannot connect to my brain right now. Let me visit the doctor!", alsa_device)
         return
 
     # ── 6. Config ────────────────────────────────────────────────
@@ -381,12 +543,7 @@ def main():
         lcd.write_string("PULSE  READY".ljust(20))
 
     # ── 8. Greeting ──────────────────────────────────────────────
-    speak(
-        f"Hello {patient_name}! "
-        f"I am the nurse assistant robot. "
-        f"I will ask you a few quick questions.",
-        alsa_device
-    )
+    speak(f"Hello {patient_name}! I am the nurse assistant robot. I will ask you a few quick questions.", alsa_device)
 
     # ── 9. Triage setup ──────────────────────────────────────────
     priority = {"STABLE": 0, "MONITOR": 1, "URGENT": 2}
@@ -398,24 +555,30 @@ def main():
     speak(first_q, alsa_device)
     time.sleep(0.5)
 
-    answer, answer_status = transcribe(record(duration=LISTEN_SEC, pa_device_index=pa_input_index))
+    audio = record(pa_device_index=pa_input_index)
+    answer, answer_status = transcribe(audio)
+    answer = confirm_answer(answer, alsa_device, pa_input_index)  # ← confirmation loop
+
     history.append({"q": first_q, "a": answer, "status": answer_status})
     if priority[answer_status] > priority[status]:
         status = answer_status
     print(f"[status] After Q1: {status}")
 
-    # ── 11. AI follow-up questions ───────────────────────────────
+    # ── 11. AI follow-up questions (streamed) ────────────────────
     for i in range(MAX_QUESTIONS - 1):
-        next_q = get_next_question(history)
+        # Streams tokens → speaks sentence chunks as they arrive
+        next_q = get_next_question_streaming(history, alsa_device)
 
         if next_q.strip().upper() == "DONE":
             print(f"[patient] AI done after {i + 1} follow-up(s).")
             break
 
-        speak(next_q, alsa_device)
         time.sleep(0.5)
 
-        answer, answer_status = transcribe(record(duration=LISTEN_SEC, pa_device_index=pa_input_index))
+        audio = record(pa_device_index=pa_input_index)
+        answer, answer_status = transcribe(audio)
+        answer = confirm_answer(answer, alsa_device, pa_input_index)  # ← confirmation loop
+
         history.append({"q": next_q, "a": answer, "status": answer_status})
         if priority[answer_status] > priority[status]:
             status = answer_status
@@ -426,21 +589,16 @@ def main():
 
     if flagged_urgent:
         status = "URGENT"
-        speak(
-            f"Based on your responses {patient_name}, "
-            f"I am alerting a nurse immediately.",
-            alsa_device
-        )
+        speak(f"Based on your responses {patient_name}, I am alerting a nurse immediately.", alsa_device)
     else:
-        speak(
-            f"Thank you {patient_name}. "
-            f"Your status has been recorded as {status}.",
-            alsa_device
-        )
+        speak(f"Thank you {patient_name}. Your status has been recorded as {status}.", alsa_device)
 
     print(f"\n[final] Status: {status} | Urgent: {flagged_urgent}")
 
-    # ── 13. Save logs ────────────────────────────────────────────
+    # ── 13. Show final status on LCD ─────────────────────────────
+    show_status_on_lcd(lcd, status, flagged_urgent)
+
+    # ── 14. Save logs ────────────────────────────────────────────
     save_log(
         session_dir,
         {
@@ -457,9 +615,6 @@ def main():
             "assessment": history
         }
     )
-
-    # ── 14. Show final status on LCD and hold forever ────────────
-    show_status_on_lcd(lcd, status, flagged_urgent)
 
 
 # ═══════════════════════════════════════════════════════════════════
