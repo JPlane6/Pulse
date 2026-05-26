@@ -8,179 +8,361 @@ from flask import Flask, request, jsonify, Response
 app = Flask(__name__)
 
 # ═══════════════════════════════════════════════════════════════════
-#  CONFIG — Optimized for Mac M2 (16GB RAM)
+# CONFIG
 # ═══════════════════════════════════════════════════════════════════
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
 TEXT_MODEL = "phi3:mini"
 SERVER_PORT = 5001
 
-# Triage keywords used for immediate, rule-based priority routing
-URGENT_KEYWORDS  = ["severe", "chest", "can't breathe", "cannot breathe",
-                    "help", "emergency", "10", "worst", "unconscious", "dying"]
-MONITOR_KEYWORDS = ["dizzy", "nausea", "pain", "uncomfortable",
-                    "worse", "7", "8", "9", "medication", "no", "bad"]
+URGENT_KEYWORDS = [
+    "severe",
+    "chest pain",
+    "can't breathe",
+    "cannot breathe",
+    "help",
+    "emergency",
+    "worst pain",
+    "unconscious",
+    "dying",
+    "pressure in chest"
+]
+
+MONITOR_KEYWORDS = [
+    "dizzy",
+    "nausea",
+    "pain",
+    "uncomfortable",
+    "worse",
+    "medication",
+    "bad",
+    "fever",
+    "vomiting",
+    "migraine"
+]
+
+WELCOME_MESSAGE = (
+    "Hi, I’m going to ask you a few quick questions "
+    "to better understand what’s going on."
+)
 
 # ═══════════════════════════════════════════════════════════════════
-#  LOAD MODELS
+# LOAD WHISPER
 # ═══════════════════════════════════════════════════════════════════
 
-print("[server] Loading Whisper STT model...")
+print("[server] Loading Whisper model...")
 whisper_model = whisper.load_model("base")
-print("[server] Whisper STT ready!")
-
+print("[server] Whisper ready!")
 
 # ═══════════════════════════════════════════════════════════════════
-#  TRIAGE ASSESSMENT HELPER
+# TRIAGE LOGIC
 # ═══════════════════════════════════════════════════════════════════
 
 def assess(text):
-    """Keyword-based triage status matching from transcribed string."""
+
     text = text.lower()
-    if any(w in text for w in URGENT_KEYWORDS):  return "URGENT"
-    if any(w in text for w in MONITOR_KEYWORDS): return "MONITOR"
+
+    if any(w in text for w in URGENT_KEYWORDS):
+        return "URGENT"
+
+    if any(w in text for w in MONITOR_KEYWORDS):
+        return "MONITOR"
+
     return "STABLE"
 
-
 # ═══════════════════════════════════════════════════════════════════
-#  ROUTE: Health check
+# HEALTH CHECK
 # ═══════════════════════════════════════════════════════════════════
 
 @app.route("/ping", methods=["GET"])
 def ping():
-    """Simple health check verification endpoint."""
-    print("[ping] Pi connected successfully.")
+
+    print("[ping] Device connected.")
     return jsonify({"status": "ok"})
 
+# ═══════════════════════════════════════════════════════════════════
+# WELCOME MESSAGE
+# ═══════════════════════════════════════════════════════════════════
+
+@app.route("/welcome", methods=["GET"])
+def welcome():
+
+    return jsonify({
+        "message": WELCOME_MESSAGE
+    })
 
 # ═══════════════════════════════════════════════════════════════════
-#  ROUTE: Transcribe audio
+# TRANSCRIBE AUDIO
 # ═══════════════════════════════════════════════════════════════════
 
 @app.route("/transcribe", methods=["POST"])
 def transcribe():
-    """Receives raw WAV bytes from Pi, processes with Whisper, returns text."""
+
     try:
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+
+        with tempfile.NamedTemporaryFile(
+            suffix=".wav",
+            delete=False
+        ) as f:
+
             f.write(request.data)
             path = f.name
 
-        result = whisper_model.transcribe(path, fp16=False, language="en")
-        text   = result["text"].strip().lower()
+        result = whisper_model.transcribe(
+            path,
+            fp16=False,
+            language="en"
+        )
+
+        text = result["text"].strip()
         status = assess(text)
+
         os.remove(path)
 
-        print(f"[transcribe] Heard: '{text}' → Evaluated Status: {status}")
-        return jsonify({"text": text, "status": status})
+        if len(text) == 0:
+
+            print("[transcribe] No speech detected.")
+
+            return jsonify({
+                "text": "",
+                "status": "STABLE",
+                "heard": False
+            })
+
+        print(f"[transcribe] Heard: '{text}' → {status}")
+
+        return jsonify({
+            "text": text,
+            "status": status,
+            "heard": True
+        })
 
     except Exception as e:
-        print(f"[transcribe] Error during processing: {e}")
-        return jsonify({"text": "", "status": "STABLE"})
 
+        print(f"[transcribe] Error: {e}")
+
+        return jsonify({
+            "text": "",
+            "status": "STABLE",
+            "heard": False
+        })
 
 # ═══════════════════════════════════════════════════════════════════
-#  ROUTE: Stream Next Question (Ultra Low-Latency)
+# STREAM NEXT QUESTION
 # ═══════════════════════════════════════════════════════════════════
 
 @app.route("/next_question", methods=["POST"])
 def next_question():
-    """Streams token strings directly from Ollama to achieve instant conversation."""
-    try:
-        history = request.get_json()["history"]
-        history_text = "\n".join([f"Q: {qa['q']}\nA: {qa['a']}" for qa in history])
 
-        # Short, crisp prompt minimizes Mac evaluation overhead
+    try:
+
+        history = request.get_json()["history"]
+
+        history_text = "\n".join([
+            f"Patient: {qa['a']}"
+            for qa in history
+        ])
+
         prompt = (
-            "You are a clinical triage nurse robot. Generate the single most important follow-up question.\n"
-            "Rules: Only reply with the question. Short and clinical. No notes. No introductions. "
-            "If you have enough info, reply with ONLY: DONE\n\n"
+            "You are a calm and caring clinical triage assistant.\n"
+            "Speak naturally and briefly.\n"
+            "Ask only ONE short follow-up question at a time.\n"
+            "Ask the MOST PERTINENT unanswered question based on the patient's last response.\n"
+            "Never repeat a question.\n"
+            "Never ask for information already given.\n"
+            "Make questions explicit and context-aware.\n"
+            "Avoid vague wording.\n"
+            "Example: if the patient mentions a headache, ask "
+            "'Where in your head does it hurt?' "
+            "instead of 'Where does it hurt?'\n"
+            "Keep questions crisp, conversational, and easy to understand.\n"
+            "Do not sound robotic or overly formal.\n"
+            "Use natural spoken English with contractions.\n"
+            "Use commas naturally for pauses.\n"
+            "Do not explain anything.\n"
+            "Do not ask multiple questions at once.\n\n"
+
+            "You must gather:\n"
+            "- Main symptom\n"
+            "- Severity\n"
+            "- Duration\n"
+            "- Breathing issues\n"
+            "- Existing conditions\n"
+            "- Medications\n\n"
+
+            "When enough information is collected, reply ONLY with: DONE\n\n"
+
             f"Conversation history:\n{history_text}\n\n"
-            "Next question (or DONE):"
+            "Assistant:"
         )
 
         def generate():
+
             try:
+
                 r = requests.post(
                     OLLAMA_URL,
                     json={
-                        "model": TEXT_MODEL, 
-                        "prompt": prompt, 
+                        "model": TEXT_MODEL,
+                        "prompt": prompt,
                         "stream": True,
                         "options": {
-                            "num_predict": 45,     # Prevents bloated responses
-                            "num_ctx": 1024,       # Limits memory context window size
-                            "temperature": 0.0,    # Zero temp generates text much faster
-                            "keep_alive": "-1"     # Locks model into Mac GPU memory permanently
+                            "temperature": 0.1,
+                            "num_predict": 35,
+                            "num_ctx": 1024,
+                            "repeat_penalty": 1.2,
+                            "top_k": 20,
+                            "top_p": 0.8,
+                            "keep_alive": "-1"
                         }
                     },
                     stream=True,
                     timeout=60
                 )
-                for line in r.iter_lines():
-                    if line:
-                        chunk = json.loads(line)
-                        token = chunk.get("response", "")
-                        done  = chunk.get("done", False)
-                        
-                        if token:
-                            yield token
-                        if done:
-                            break
-            except Exception as e:
-                print(f"[next_question] Streaming loop broken: {e}")
-                yield "DONE"
 
-        return Response(generate(), mimetype="text/event-stream")
+                buffer = ""
+                full_response = ""
+
+                for line in r.iter_lines():
+
+                    if line:
+
+                        chunk = json.loads(line)
+
+                        token = chunk.get("response", "")
+                        done = chunk.get("done", False)
+
+                        if token:
+
+                            full_response += token
+                            buffer += token
+
+                            # Flush only at natural speech boundaries
+                            if any(p in buffer for p in [".", "?", "!", ","]):
+
+                                cleaned = buffer.strip()
+
+                                if cleaned:
+                                    yield f"data: {cleaned}\n\n"
+
+                                buffer = ""
+
+                        if done:
+
+                            # Flush remaining text
+                            if buffer.strip():
+
+                                yield f"data: {buffer.strip()}\n\n"
+
+                            yield "data: [DONE]\n\n"
+
+                            break
+
+                print(f"[next_question] Generated: {full_response}")
+
+            except Exception as e:
+
+                print(f"[next_question] Streaming error: {e}")
+
+                yield "data: DONE\n\n"
+
+        return Response(
+            generate(),
+            mimetype="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no"
+            }
+        )
 
     except Exception as e:
-        print(f"[next_question] Setup error: {e}")
-        return Response("DONE", mimetype="text/plain")
 
+        print(f"[next_question] Setup error: {e}")
+
+        return Response(
+            "data: DONE\n\n",
+            mimetype="text/event-stream"
+        )
 
 # ═══════════════════════════════════════════════════════════════════
-#  ROUTE: Final urgent flag
+# FINAL URGENCY CHECK
 # ═══════════════════════════════════════════════════════════════════
 
 @app.route("/flag_urgent", methods=["POST"])
 def flag_urgent():
-    """Asks Phi3 for a definitive evaluation on whether to alert the desk."""
+
     try:
+
         history = request.get_json()["history"]
-        history_text = "\n".join([f"Q: {qa['q']}\nA: {qa['a']}" for qa in history])
+
+        history_text = "\n".join([
+            f"Q: {qa['q']}\nA: {qa['a']}"
+            for qa in history
+        ])
 
         prompt = (
-            "Review this medical history dialogue. Is emergency attention required? "
-            "Look for severe pain (8-10), chest compression, breathing struggle, or critical conditions.\n"
-            f"Dialogue:\n{history_text}\n\n"
-            "Reply with exactly one word, YES or NO:"
+            "You are reviewing a medical triage conversation.\n"
+            "Determine whether emergency attention may be needed.\n"
+            "Look for:\n"
+            "- Chest pain\n"
+            "- Trouble breathing\n"
+            "- Severe pain\n"
+            "- Loss of consciousness\n"
+            "- Stroke symptoms\n"
+            "- Signs of medical emergency\n\n"
+
+            f"Conversation:\n{history_text}\n\n"
+
+            "Reply with ONLY one word:\n"
+            "YES or NO"
         )
 
         r = requests.post(
             OLLAMA_URL,
             json={
-                "model": TEXT_MODEL, 
-                "prompt": prompt, 
+                "model": TEXT_MODEL,
+                "prompt": prompt,
                 "stream": False,
                 "options": {
-                    "num_predict": 5,
-                    "num_ctx": 1024,
                     "temperature": 0.0,
+                    "num_predict": 3,
+                    "num_ctx": 1024,
                     "keep_alive": "-1"
                 }
             },
             timeout=60
         )
-        result  = r.json()["response"].strip().upper().split("\n")[0]
+
+        result = r.json()["response"].strip().upper()
+
         flagged = "YES" in result
 
-        print(f"[flag_urgent] LLM Decision: {result} → Flagged={flagged}")
-        return jsonify({"flagged_urgent": flagged})
+        print(f"[flag_urgent] {result} → flagged={flagged}")
+
+        return jsonify({
+            "flagged_urgent": flagged
+        })
 
     except Exception as e:
-        print(f"[flag_urgent] Error evaluating urgency: {e}")
-        return jsonify({"flagged_urgent": False})
 
+        print(f"[flag_urgent] Error: {e}")
+
+        return jsonify({
+            "flagged_urgent": False
+        })
+
+# ═══════════════════════════════════════════════════════════════════
+# START SERVER
+# ═══════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    print(f"[server] Starting Flask engine on 0.0.0.0:{SERVER_PORT}")
-    app.run(host="0.0.0.0", port=SERVER_PORT, debug=False)
+
+    print(f"[server] Starting on 0.0.0.0:{SERVER_PORT}")
+
+    app.run(
+        host="0.0.0.0",
+        port=SERVER_PORT,
+        debug=False,
+        threaded=True
+    )
