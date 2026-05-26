@@ -34,7 +34,7 @@ AUDIO_DEVICE_KEYWORD = "USB"      # Identifies your target USB mic & speaker
 PIPER_MODEL      = "/home/ayushs0604/Pulse/en_US-amy-medium.onnx"
 
 # --- Feature 3: Barge-In Interruption Toggle & COMBO HARDWARE Tuning ---
-BARGE_IN_ENABLED     = True       # Set to False to disable user interrupting the robot
+BARGE_IN_ENABLED     = False       # Set to False to disable user interrupting the robot
 VAD_THRESHOLD        = 0.90       # Sharp confidence filter
 BARGE_IN_IGNORE_SECS = 6.0        # STRETCHED LOCKOUT: Blind the mic for 6 seconds to clear introductory hardware echo loops
 
