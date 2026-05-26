@@ -1,9 +1,12 @@
+# =========================
+# server.py
+# =========================
+
 import whisper
 import requests
 import tempfile
 import os
-import json
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
@@ -77,7 +80,6 @@ def assess(text):
 @app.route("/ping", methods=["GET"])
 def ping():
 
-    print("[ping] Device connected.")
     return jsonify({"status": "ok"})
 
 # ═══════════════════════════════════════════════════════════════════
@@ -121,15 +123,13 @@ def transcribe():
 
         if len(text) == 0:
 
-            print("[transcribe] No speech detected.")
-
             return jsonify({
                 "text": "",
                 "status": "STABLE",
                 "heard": False
             })
 
-        print(f"[transcribe] Heard: '{text}' → {status}")
+        print(f"[transcribe] '{text}' → {status}")
 
         return jsonify({
             "text": text,
@@ -148,7 +148,7 @@ def transcribe():
         })
 
 # ═══════════════════════════════════════════════════════════════════
-# STREAM NEXT QUESTION
+# NEXT QUESTION
 # ═══════════════════════════════════════════════════════════════════
 
 @app.route("/next_question", methods=["POST"])
@@ -167,7 +167,7 @@ def next_question():
             "You are a calm and caring clinical triage assistant.\n"
             "Speak naturally and briefly.\n"
             "Ask only ONE short follow-up question at a time.\n"
-            "Ask the MOST PERTINENT unanswered question based on the patient's last response.\n"
+            "Ask the MOST PERTINENT unanswered question.\n"
             "Never repeat a question.\n"
             "Never ask for information already given.\n"
             "Make questions explicit and context-aware.\n"
@@ -175,10 +175,8 @@ def next_question():
             "Example: if the patient mentions a headache, ask "
             "'Where in your head does it hurt?' "
             "instead of 'Where does it hurt?'\n"
-            "Keep questions crisp, conversational, and easy to understand.\n"
-            "Do not sound robotic or overly formal.\n"
-            "Use natural spoken English with contractions.\n"
-            "Use commas naturally for pauses.\n"
+            "Keep questions crisp and conversational.\n"
+            "Use natural spoken English.\n"
             "Do not explain anything.\n"
             "Do not ask multiple questions at once.\n\n"
 
@@ -192,98 +190,44 @@ def next_question():
 
             "When enough information is collected, reply ONLY with: DONE\n\n"
 
-            f"Conversation history:\n{history_text}\n\n"
+            f"Conversation:\n{history_text}\n\n"
             "Assistant:"
         )
 
-        def generate():
-
-            try:
-
-                r = requests.post(
-                    OLLAMA_URL,
-                    json={
-                        "model": TEXT_MODEL,
-                        "prompt": prompt,
-                        "stream": True,
-                        "options": {
-                            "temperature": 0.1,
-                            "num_predict": 35,
-                            "num_ctx": 1024,
-                            "repeat_penalty": 1.2,
-                            "top_k": 20,
-                            "top_p": 0.8,
-                            "keep_alive": "-1"
-                        }
-                    },
-                    stream=True,
-                    timeout=60
-                )
-
-                buffer = ""
-                full_response = ""
-
-                for line in r.iter_lines():
-
-                    if line:
-
-                        chunk = json.loads(line)
-
-                        token = chunk.get("response", "")
-                        done = chunk.get("done", False)
-
-                        if token:
-
-                            full_response += token
-                            buffer += token
-
-                            # Flush only at natural speech boundaries
-                            if any(p in buffer for p in [".", "?", "!", ","]):
-
-                                cleaned = buffer.strip()
-
-                                if cleaned:
-                                    yield f"data: {cleaned}\n\n"
-
-                                buffer = ""
-
-                        if done:
-
-                            # Flush remaining text
-                            if buffer.strip():
-
-                                yield f"data: {buffer.strip()}\n\n"
-
-                            yield "data: [DONE]\n\n"
-
-                            break
-
-                print(f"[next_question] Generated: {full_response}")
-
-            except Exception as e:
-
-                print(f"[next_question] Streaming error: {e}")
-
-                yield "data: DONE\n\n"
-
-        return Response(
-            generate(),
-            mimetype="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no"
-            }
+        r = requests.post(
+            OLLAMA_URL,
+            json={
+                "model": TEXT_MODEL,
+                "prompt": prompt,
+                "stream": False,
+                "options": {
+                    "temperature": 0.1,
+                    "num_predict": 35,
+                    "num_ctx": 1024,
+                    "repeat_penalty": 1.2,
+                    "top_k": 20,
+                    "top_p": 0.8,
+                    "keep_alive": "-1"
+                }
+            },
+            timeout=60
         )
+
+        response_text = r.json()["response"].strip()
+
+        print(f"[next_question] {response_text}")
+
+        return jsonify({
+            "question": response_text
+        })
 
     except Exception as e:
 
-        print(f"[next_question] Setup error: {e}")
+        print(f"[next_question] Error: {e}")
 
-        return Response(
-            "data: DONE\n\n",
-            mimetype="text/event-stream"
-        )
+        return jsonify({
+            "question": "Could you repeat that?"
+        })
 
 # ═══════════════════════════════════════════════════════════════════
 # FINAL URGENCY CHECK
@@ -304,18 +248,9 @@ def flag_urgent():
         prompt = (
             "You are reviewing a medical triage conversation.\n"
             "Determine whether emergency attention may be needed.\n"
-            "Look for:\n"
-            "- Chest pain\n"
-            "- Trouble breathing\n"
-            "- Severe pain\n"
-            "- Loss of consciousness\n"
-            "- Stroke symptoms\n"
-            "- Signs of medical emergency\n\n"
+            "Reply ONLY with YES or NO.\n\n"
 
-            f"Conversation:\n{history_text}\n\n"
-
-            "Reply with ONLY one word:\n"
-            "YES or NO"
+            f"Conversation:\n{history_text}"
         )
 
         r = requests.post(
@@ -338,7 +273,7 @@ def flag_urgent():
 
         flagged = "YES" in result
 
-        print(f"[flag_urgent] {result} → flagged={flagged}")
+        print(f"[flag_urgent] {result}")
 
         return jsonify({
             "flagged_urgent": flagged
@@ -358,7 +293,7 @@ def flag_urgent():
 
 if __name__ == "__main__":
 
-    print(f"[server] Starting on 0.0.0.0:{SERVER_PORT}")
+    print(f"[server] Starting on port {SERVER_PORT}")
 
     app.run(
         host="0.0.0.0",
