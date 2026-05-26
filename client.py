@@ -9,7 +9,6 @@ import time
 import subprocess
 import json
 import threading
-import queue  # Thread-safe audio buffering for streaming playback
 from datetime import datetime
 import scipy.signal as signal
 import numpy as np
@@ -28,7 +27,7 @@ torch.set_num_interop_threads(1)
 # ═══════════════════════════════════════════════════════════════════
 
 SERVER_URL       = "http://192.168.0.157:5001"
-MAX_QUESTIONS    = 6
+MAX_QUESTIONS    = 3
 SAMPLERATE       = 16000          # Internal rate needed by Silero/Whisper
 AUDIO_DEVICE_KEYWORD = "USB"      # Identifies your target USB mic & speaker
 PIPER_MODEL      = "/home/ayushs0604/Pulse/en_US-amy-medium.onnx"
@@ -47,13 +46,6 @@ LED_BLUE_PIN     = 22             # Lights up for MONITOR status
 VAD_SILENCE_DURATION  = 1.5    # Seconds of silence required to close recording
 VAD_MAX_DURATION      = 15     # Safety stop cap to prevent infinite loop listening
 VAD_FRAME_SAMPLES     = 512    # Core sample slice evaluation window size
-
-# --- Confirmation logic options ---
-CONFIRM_SILENCE_DURATION = 0.8
-CONFIRM_MAX_DURATION     = 5
-YES_KEYWORDS = ["yes", "yeah", "yep", "correct", "right", "sure", "mhm", "yup"]
-NO_KEYWORDS  = ["no", "nope", "nah", "wrong", "incorrect", "not", "didn't", "that's not"]
-MAX_CONFIRM_RETRIES = 2
 
 LOG_DIR           = os.path.join(os.path.dirname(os.path.abspath(__file__)), "modules", "logs")
 PATIENT_INFO_PATH = os.path.join(LOG_DIR, "patientINFO.json")
@@ -353,61 +345,27 @@ def record(pa_device_index, silence_duration=VAD_SILENCE_DURATION, max_duration=
 #  STREAM CONNECTOR FOR RUNTIME QUESTION EXECUTION
 # ═══════════════════════════════════════════════════════════════════
 
-def get_next_question_streaming(history, alsa_device, pa_device_index=None):
+def get_next_question(history):
+
     try:
-        r = requests.post(f"{SERVER_URL}/next_question", json={"history": history}, stream=True, timeout=60)
-        full_text = ""
-        word_buffer = []
-        
-        piper = subprocess.Popen(
-            ["piper", "--model", PIPER_MODEL, "--output_raw"],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
-        )
-        aplay = subprocess.Popen(
-            ["aplay", "-D", alsa_device, "-r", "22050", "-f", "S16_LE", "-c", "1"],
-            stdin=piper.stdout, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+
+        r = requests.post(
+            f"{SERVER_URL}/next_question",
+            json={"history": history},
+            timeout=60
         )
 
-        if BARGE_IN_ENABLED and (pa_device_index is not None):
-            barge_thread = threading.Thread(target=monitor_barge_in, args=(aplay, piper, pa_device_index), daemon=True)
-            barge_thread.start()
+        result = r.json()["question"].strip()
 
-        print("[stream] Initializing token stream readout...")
-        for chunk in r.iter_content(chunk_size=None, decode_unicode=True):
-            if not chunk: continue
-            full_text += chunk
-            word_buffer.append(chunk)
+        print(f"[next_question] '{result}'")
 
-            if len(word_buffer) >= 2:
-                phrase = "".join(word_buffer)
-                print(f"[stream] Writing chunk: '{phrase}'", end="", flush=True)
-                if piper.poll() is None:
-                    try:
-                        piper.stdin.write(phrase.encode("utf-8"))
-                        piper.stdin.flush()
-                    except IOError:
-                        break
-                word_buffer = []
-
-        if word_buffer and piper.poll() is None:
-            try:
-                piper.stdin.write("".join(word_buffer).encode("utf-8"))
-                piper.stdin.flush()
-            except IOError: pass
-
-        print("\n[stream] Generation complete. Wrapping up speech lines...")
-        try: piper.stdin.close()
-        except Exception: pass
-        aplay.wait()
-        piper.wait()
-        time.sleep(0.6)
-
-        result = full_text.strip().split("\n")[0]
         return result
-    except Exception as e:
-        print(f"[stream] Connection process encountered failure: {e}")
-        return "DONE"
 
+    except Exception as e:
+
+        print(f"[next_question] Error: {e}")
+
+        return "DONE"
 
 # ═══════════════════════════════════════════════════════════════════
 #  SERVER UTILITY CALL TRANSFERS WITH SAFER HANDLING
@@ -436,49 +394,6 @@ def check_urgent(history):
         return r.json()["flagged_urgent"]
     except Exception:
         return False
-
-
-# ═══════════════════════════════════════════════════════════════════
-#  FEATURE 2: LOCAL AMBIGUITY EVALUATION LOOP
-# ═══════════════════════════════════════════════════════════════════
-
-def confirm_answer(answer_text, alsa_device, pa_device_index):
-    """Verifies response validity and isolates conversational ambiguity locally."""
-    current_answer = answer_text
-
-    for attempt in range(MAX_CONFIRM_RETRIES + 1):
-        if not current_answer.strip() or len(current_answer.strip()) < 2:
-            print("[confirm-local] Caught empty or ambiguous string entry. Requesting clarification.")
-            speak("I didn't quite catch that. Could you please repeat your response clearly?", alsa_device, pa_device_index)
-            audio = record(pa_device_index)
-            new_answer, _ = transcribe(audio)
-            current_answer = new_answer
-            continue
-
-        speak(f"I heard: {current_answer}. Is that correct?", alsa_device, pa_device_index)
-        audio = record(pa_device_index, silence_duration=CONFIRM_SILENCE_DURATION, max_duration=CONFIRM_MAX_DURATION)
-        response, _ = transcribe(audio)
-        response_lower = response.lower()
-
-        print(f"[confirm] Checking user confirmation phrase: '{response_lower}'")
-
-        if any(word in response_lower for word in YES_KEYWORDS):
-            return current_answer
-
-        if any(word in response_lower for word in NO_KEYWORDS):
-            if attempt < MAX_CONFIRM_RETRIES:
-                speak("My apologies. Please state your answer again.", alsa_device, pa_device_index)
-                audio = record(pa_device_index)
-                new_answer, _ = transcribe(audio)
-                current_answer = new_answer
-            else:
-                speak("Thank you, noting that down.", alsa_device, pa_device_index)
-                return current_answer
-        else:
-            print("[confirm] Ambiguous phrasing sequence — pushing cycle forward.")
-            return current_answer
-
-    return current_answer
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -575,18 +490,17 @@ def main():
 
     set_status_led("STABLE")
 
-    speak(f"Hello {patient_name}! I am your nurse assistant robot. Let's check in on you.", alsa_device, pa_input_index)
+    speak(f"Hello {patient_name}! Good Day, I am pulse. ", alsa_device, pa_input_index)
 
     priority = {"STABLE": 0, "MONITOR": 1, "URGENT": 2}
     history  = []
     status   = "STABLE"
 
-    first_q = "On a scale of 1 to 10, how would you rate your pain right now?"
+    first_q = "What’s bothering you right now?"
     speak(first_q, alsa_device, pa_input_index)
     
     audio = record(pa_device_index=pa_input_index)
     answer, answer_status = transcribe(audio)
-    answer = confirm_answer(answer, alsa_device, pa_input_index)
 
     history.append({"q": first_q, "a": answer, "status": answer_status})
     if priority[answer_status] > priority[status]: status = answer_status
@@ -597,8 +511,7 @@ def main():
     # Main Conversation Loop (Can break out early at any point)
     for i in range(MAX_QUESTIONS - 1):
         print(f"\n--- Follow-up Question Cycle {i+1} of {MAX_QUESTIONS-1} ---")
-        next_q = get_next_question_streaming(history, alsa_device, pa_input_index)
-        
+        next_q = get_next_question(history)        
         # EARLY EXIT GROUND RULE 1: Server drops explicit DONE phrase
         if next_q.strip().upper() == "DONE":
             print("[main] LLM invoked 'DONE' signal. Ending session loop early.")
@@ -606,7 +519,6 @@ def main():
 
         audio = record(pa_device_index=pa_input_index)
         answer, answer_status = transcribe(audio)
-        answer = confirm_answer(answer, alsa_device, pa_input_index)
 
         history.append({"q": next_q, "a": answer, "status": answer_status})
         if priority[answer_status] > priority[status]: status = answer_status

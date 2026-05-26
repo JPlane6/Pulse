@@ -18,7 +18,7 @@ from datetime import datetime
 
 # --- Constants --- (UNCHANGED)
 LIDAR_PORT              = "/dev/lidar"
-OBSTACLE_THRESHOLD_CM   = 50
+OBSTACLE_THRESHOLD_CM   = 45
 OPENING_INCREASE_CM     = 12
 
 # --- Turn-and-enter constants (UNCHANGED) ---

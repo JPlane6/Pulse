@@ -13,7 +13,7 @@ SIDE_CONE    = 5     # Side detection range: L=335-345°, R=145-155°
 
 # Zone-specific minimum distances
 MIN_FRONT_DISTANCE_CM = 35.0  # Front: Filter robot chassis
-MIN_SIDE_DISTANCE_CM = 20.0   # Left/Right: Detect corridor walls (typically 30-40cm)
+MIN_SIDE_DISTANCE_CM = 15.0   # Left/Right: Detect corridor walls (typically 30-40cm)
 MAX_DISTANCE_CM = 300.0       # Ignore anything farther than 300cm
 
 def m_to_cm(meters):
