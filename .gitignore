@@ -8,8 +8,8 @@ __pycache__/
 *.pyo
 
 # TTS Models
-en_US-amy-medium.onnx
-en_US-amy-medium.onnx.json
+en_US-hfc_female-medium.onnx
+en_US-hfc_female-medium.onnx.json
 
 
 # Large model files — do not commit these
