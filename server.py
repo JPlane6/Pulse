@@ -25,14 +25,29 @@ WELCOME_MESSAGE = (
 # ═══════════════════════════════════════════════════════════════════
 
 print("[server] Loading Whisper model...")
-whisper_model = whisper.load_model("base")
+whisper_model = whisper.load_model("small")   # upgraded from base → small
 print("[server] Whisper ready!")
 
 # ═══════════════════════════════════════════════════════════════════
 # TRIAGE LOGIC
 # ═══════════════════════════════════════════════════════════════════
 
+URGENT_HARD = [
+    "can't breathe", "cannot breathe", "chest pain", "chest tightness",
+    "heart attack", "unconscious", "unresponsive", "not breathing",
+    "stopped breathing", "seizure", "stroke", "overdose", "bleeding out",
+    "can't move", "cannot move", "help me", "dying"
+]
+
+MONITOR_HARD = [
+    "dizzy", "dizziness", "nausea", "vomiting", "fever", "chills",
+    "shortness of breath", "hard to breathe", "difficulty breathing",
+    "swelling", "rash", "allergic", "infection", "confusion", "disoriented"
+]
+
+
 def extract_pain_score(text):
+    # Try digit first (more reliable)
     match = re.search(r'\b(10|[1-9])\b', text)
     if match:
         return int(match.group(1))
@@ -42,40 +57,66 @@ def extract_pain_score(text):
         "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10
     }
     for word, val in word_map.items():
-        if word in text.lower():
+        if re.search(rf'\b{word}\b', text.lower()):
             return val
 
     return None
 
 
 def assess(text):
+    """
+    Three-tier classifier.  Returns "URGENT", "MONITOR", or "STABLE".
+
+    Priority order:
+      1. Hard-coded keyword shortcuts (fast, reliable)
+      2. Pain score parsing
+      3. AI classification via phi3:mini (fallback)
+    """
     if not text.strip():
         return "STABLE"
 
-    # Don't trust classification on very short or gibberish responses
     words = text.strip().split()
     if len(words) < 2:
         return "STABLE"
 
-    # Pain score — hard numeric signal, most reliable
-    score = extract_pain_score(text.lower())
+    lower = text.lower()
+
+    # ── 1. Hard keyword shortcuts ───────────────────────────────────
+    for kw in URGENT_HARD:
+        if kw in lower:
+            print(f"[assess] URGENT via keyword: '{kw}'")
+            return "URGENT"
+
+    for kw in MONITOR_HARD:
+        if kw in lower:
+            print(f"[assess] MONITOR via keyword: '{kw}'")
+            return "MONITOR"
+
+    # ── 2. Pain score ───────────────────────────────────────────────
+    score = extract_pain_score(lower)
     if score is not None:
         if score >= 8:
             return "URGENT"
-        if score >= 5:
+        if score >= 4:
             return "MONITOR"
+        # 1-3 → STABLE, fall through to AI for confirmation
 
-    # AI classification for everything else
+    # ── 3. AI classification ────────────────────────────────────────
     try:
         prompt = (
             "You are a clinical triage assistant.\n"
-            "A patient said: \"{text}\"\n"
-            "Classify their condition as exactly one of: URGENT, MONITOR, STABLE\n"
-            "URGENT = severe pain, chest pain, can't breathe, unconscious, emergency\n"
-            "MONITOR = moderate pain, dizziness, nausea, fever, discomfort\n"
-            "STABLE = mild or no symptoms, feeling fine\n"
-            "If the response is unclear or doesn't describe symptoms, reply: STABLE\n"
-            "Reply with only one word: URGENT, MONITOR, or STABLE"
+            "A patient said: \"{text}\"\n\n"
+            "Classify their condition as exactly one of: URGENT, MONITOR, STABLE\n\n"
+            "URGENT = life-threatening emergency: severe chest pain, cannot breathe, "
+            "unconscious, uncontrolled bleeding, seizure, stroke symptoms.\n"
+            "MONITOR = moderate concern needing attention soon: moderate pain (4-7/10), "
+            "fever, dizziness, nausea, shortness of breath, confusion.\n"
+            "STABLE = mild or no symptoms: low pain (1-3/10), feeling okay, minor discomfort.\n\n"
+            "IMPORTANT: Only classify as URGENT if there are very clear emergency signals. "
+            "When in doubt between URGENT and MONITOR, choose MONITOR. "
+            "When in doubt between MONITOR and STABLE, choose STABLE.\n"
+            "If the response is vague, unclear, or doesn't describe symptoms, reply: STABLE\n\n"
+            "Reply with ONLY one word: URGENT, MONITOR, or STABLE"
         ).format(text=text)
 
         r = requests.post(
@@ -86,7 +127,7 @@ def assess(text):
                 "stream": False,
                 "options": {
                     "temperature": 0.0,
-                    "num_predict": 3,
+                    "num_predict": 5,
                     "num_ctx": 512,
                     "keep_alive": "-1"
                 }
@@ -95,6 +136,7 @@ def assess(text):
         )
 
         result = r.json()["response"].strip().upper().split("\n")[0]
+        print(f"[assess] AI says: {result}")
 
         if "URGENT" in result:
             return "URGENT"
@@ -136,7 +178,14 @@ def transcribe():
             f.write(request.data)
             path = f.name
 
-        result = whisper_model.transcribe(path, fp16=False, language="en")
+        result = whisper_model.transcribe(
+            path,
+            fp16=False,
+            language="en",
+            condition_on_previous_text=False,   # prevents hallucination loops
+            no_speech_threshold=0.6,            # more aggressive silence rejection
+            logprob_threshold=-1.0,             # drop low-confidence words
+        )
         text   = result["text"].strip()
         status = assess(text)
         os.remove(path)
@@ -244,6 +293,10 @@ def next_question():
 
 @app.route("/flag_urgent", methods=["POST"])
 def flag_urgent():
+    """
+    Final holistic pass over the full conversation.
+    Much stricter than per-answer assess() — only fires on clear emergencies.
+    """
     try:
         history = request.get_json()["history"]
 
@@ -252,13 +305,35 @@ def flag_urgent():
             for qa in history
         ])
 
+        # Count how many answers were already flagged URGENT
+        urgent_count  = sum(1 for qa in history if qa.get("status") == "URGENT")
+        monitor_count = sum(1 for qa in history if qa.get("status") == "MONITOR")
+
+        # Quick exit: if nothing was flagged URGENT during Q&A, skip the AI call
+        # unless 3+ MONITOR flags — then still check
+        if urgent_count == 0 and monitor_count < 3:
+            print(f"[flag_urgent] No urgent signals during Q&A (U:{urgent_count} M:{monitor_count}) — skipping AI, returning False")
+            return jsonify({"flagged_urgent": False})
+
         prompt = (
-            "You are reviewing a medical triage conversation.\n"
-            "Determine whether emergency attention may be needed.\n"
-            "Only flag YES if there are clear and definite emergency signals.\n"
-            "Unclear or vague responses should be flagged NO.\n"
-            "Reply ONLY with YES or NO.\n\n"
-            f"Conversation:\n{history_text}"
+            "You are a senior nurse reviewing a completed triage conversation.\n"
+            "Decide whether this patient needs IMMEDIATE emergency attention RIGHT NOW.\n\n"
+            "Flag YES only if the conversation clearly describes:\n"
+            "- Chest pain or pressure\n"
+            "- Inability to breathe or severe shortness of breath\n"
+            "- Unconsciousness or unresponsiveness\n"
+            "- Uncontrolled bleeding\n"
+            "- Seizure or stroke symptoms\n"
+            "- Pain rated 9 or 10 out of 10\n"
+            "- Any other immediately life-threatening condition\n\n"
+            "Flag NO for:\n"
+            "- Moderate pain (1-8/10) with no other emergency signs\n"
+            "- Nausea, fever, dizziness alone\n"
+            "- Vague or unclear responses\n"
+            "- Discomfort that is not life-threatening\n\n"
+            "When in doubt, reply NO.\n\n"
+            f"Conversation:\n{history_text}\n\n"
+            "Reply ONLY with YES or NO."
         )
 
         r = requests.post(
@@ -277,10 +352,10 @@ def flag_urgent():
             timeout=60
         )
 
-        result  = r.json()["response"].strip().upper()
-        flagged = "YES" in result
+        result  = r.json()["response"].strip().upper().split("\n")[0]
+        flagged = result.startswith("YES")   # stricter match than "YES" in result
 
-        print(f"[flag_urgent] {result}")
+        print(f"[flag_urgent] AI says: {result} → flagged={flagged}")
         return jsonify({"flagged_urgent": flagged})
 
     except Exception as e:

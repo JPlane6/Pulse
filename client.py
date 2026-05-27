@@ -66,9 +66,9 @@ RED_LINE = GREEN_LINE = BLUE_LINE = None
 
 try:
     import gpiod
-    target_chip = 'gpiochip0'
-    if not os.path.exists('/dev/gpiochip0') and os.path.exists('/dev/gpiochip4'):
-        target_chip = 'gpiochip4'
+    target_chip = "gpiochip0"
+    if not os.path.exists("/dev/gpiochip0") and os.path.exists("/dev/gpiochip4"):
+        target_chip = "gpiochip4"
     LED_CHIP   = gpiod.Chip(target_chip)
     RED_LINE   = LED_CHIP.get_line(LED_RED_PIN)
     GREEN_LINE = LED_CHIP.get_line(LED_GREEN_PIN)
@@ -114,12 +114,12 @@ def set_status_led(status_type):
 def run_microphone_calibration(pa_device_index):
     print("[calibration] Running 2-second mic diagnostic...")
     try:
-        device_info = sd.query_devices(pa_device_index, 'input')
-        native_sr   = int(device_info['default_samplerate'])
+        device_info = sd.query_devices(pa_device_index, "input")
+        native_sr   = int(device_info["default_samplerate"])
     except Exception:
         native_sr = 48000
     try:
-        recording = sd.rec(int(2.0 * native_sr), samplerate=native_sr, channels=1, dtype='int16', device=pa_device_index)
+        recording = sd.rec(int(2.0 * native_sr), samplerate=native_sr, channels=1, dtype="int16", device=pa_device_index)
         sd.wait()
         rms = np.sqrt(np.mean(recording.flatten().astype(np.float32) ** 2))
         print(f"[calibration] RMS: {rms:.2f}")
@@ -139,13 +139,13 @@ def run_microphone_calibration(pa_device_index):
 def monitor_barge_in(aplay_process, piper_process, pa_device_index):
     start_time = time.time()
     try:
-        device_info = sd.query_devices(pa_device_index, 'input')
-        native_sr   = int(device_info['default_samplerate'])
+        device_info = sd.query_devices(pa_device_index, "input")
+        native_sr   = int(device_info["default_samplerate"])
     except Exception:
         native_sr = 48000
     hw_blocksize = int(VAD_FRAME_SAMPLES * (native_sr / SAMPLERATE))
     try:
-        with sd.InputStream(samplerate=native_sr, channels=1, dtype='int16', device=pa_device_index, blocksize=hw_blocksize) as stream:
+        with sd.InputStream(samplerate=native_sr, channels=1, dtype="int16", device=pa_device_index, blocksize=hw_blocksize) as stream:
             while aplay_process.poll() is None:
                 frame, _ = stream.read(hw_blocksize)
                 if time.time() - start_time < BARGE_IN_IGNORE_SECS:
@@ -253,7 +253,7 @@ def speak(text, alsa_device, pa_device_index=None):
 
 def record(pa_device_index, silence_duration=VAD_SILENCE_DURATION, max_duration=VAD_MAX_DURATION):
     try:
-        native_sr = int(sd.query_devices(pa_device_index, 'input')['default_samplerate'])
+        native_sr = int(sd.query_devices(pa_device_index, "input")["default_samplerate"])
     except Exception:
         native_sr = 48000
 
@@ -271,7 +271,7 @@ def record(pa_device_index, silence_duration=VAD_SILENCE_DURATION, max_duration=
     print(f"[mic] Listening at {native_sr}Hz...")
 
     try:
-        with sd.InputStream(samplerate=native_sr, channels=1, dtype='int16',
+        with sd.InputStream(samplerate=native_sr, channels=1, dtype="int16",
                             device=pa_device_index, blocksize=hw_blocksize) as stream:
             for _ in range(max_frames):
                 frame           = np.ascontiguousarray(stream.read(hw_blocksize)[0], dtype=np.int16)
@@ -448,7 +448,7 @@ def main():
     # First question
     first_q = f"Hello {patient_name}! I am Pulse. What's bothering you today?"
     speak(first_q, alsa_device, pa_input_index)
-    audio          = record(pa_device_index=pa_input_index)
+    audio                 = record(pa_device_index=pa_input_index)
     answer, answer_status = transcribe(audio)
     history.append({"q": first_q, "a": answer, "status": answer_status})
     if priority[answer_status] > priority[status]:
@@ -467,7 +467,7 @@ def main():
             break
 
         speak(next_q, alsa_device, pa_input_index)
-        audio          = record(pa_device_index=pa_input_index)
+        audio                 = record(pa_device_index=pa_input_index)
         answer, answer_status = transcribe(audio)
         history.append({"q": next_q, "a": answer, "status": answer_status})
         if priority[answer_status] > priority[status]:
@@ -475,19 +475,28 @@ def main():
         set_status_led(status)
         print(f"[status] {status}")
 
-        if status == "URGENT":
-            print("[main] URGENT threshold hit — ending questions early.")
+        # Only short-circuit on URGENT if a hard keyword or very high pain was detected.
+        # Do NOT break just because the per-answer classifier returned URGENT —
+        # let the final flag_urgent call make the definitive call.
+        # We only hard-break if status has been URGENT for 2+ consecutive answers.
+        urgent_streak = sum(1 for qa in history[-2:] if qa.get("status") == "URGENT")
+        if urgent_streak >= 2:
+            print("[main] Two consecutive URGENT answers — ending questions early.")
             break
 
-    # Final decision
+    # ── Final decision ─────────────────────────────────────────────
+    # flag_urgent is the authoritative call.
+    # We do NOT OR it with status == URGENT here — the server already
+    # considers Q&A urgency counts internally before calling the AI.
     print("\n--- Finalizing ---")
-    flagged_urgent = check_urgent(history) or (status == "URGENT")
+    flagged_urgent = check_urgent(history)
 
     if flagged_urgent:
         status = "URGENT"
         set_status_led("URGENT")
         speak(f"Based on your responses {patient_name}, I am alerting a nurse immediately.", alsa_device, pa_input_index)
     else:
+        # Status may still be MONITOR — that's fine, no nurse alert needed
         speak(f"Thank you {patient_name}. Your assessment is complete.", alsa_device, pa_input_index)
 
     speak("Thank you for your time. Feel better soon.", alsa_device, pa_input_index)
