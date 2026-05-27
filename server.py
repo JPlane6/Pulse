@@ -3,6 +3,7 @@ import requests
 import tempfile
 import os
 import re
+import json
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
@@ -25,11 +26,11 @@ WELCOME_MESSAGE = (
 # ═══════════════════════════════════════════════════════════════════
 
 print("[server] Loading Whisper model...")
-whisper_model = whisper.load_model("small")   # upgraded from base → small
+whisper_model = whisper.load_model("small")
 print("[server] Whisper ready!")
 
 # ═══════════════════════════════════════════════════════════════════
-# TRIAGE LOGIC
+# TRIAGE KEYWORDS  (fast path — no Phi3 needed)
 # ═══════════════════════════════════════════════════════════════════
 
 URGENT_HARD = [
@@ -47,11 +48,9 @@ MONITOR_HARD = [
 
 
 def extract_pain_score(text):
-    # Try digit first (more reliable)
     match = re.search(r'\b(10|[1-9])\b', text)
     if match:
         return int(match.group(1))
-
     word_map = {
         "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
         "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10
@@ -59,94 +58,37 @@ def extract_pain_score(text):
     for word, val in word_map.items():
         if re.search(rf'\b{word}\b', text.lower()):
             return val
-
     return None
 
 
-def assess(text):
+def keyword_status(text):
     """
-    Three-tier classifier.  Returns "URGENT", "MONITOR", or "STABLE".
-
-    Priority order:
-      1. Hard-coded keyword shortcuts (fast, reliable)
-      2. Pain score parsing
-      3. AI classification via phi3:mini (fallback)
+    Fast keyword + pain-score classifier.
+    Returns 'URGENT', 'MONITOR', 'STABLE', or None if uncertain.
+    None means we need Phi3 to decide.
     """
-    if not text.strip():
-        return "STABLE"
-
-    words = text.strip().split()
-    if len(words) < 2:
+    if not text.strip() or len(text.strip().split()) < 2:
         return "STABLE"
 
     lower = text.lower()
 
-    # ── 1. Hard keyword shortcuts ───────────────────────────────────
     for kw in URGENT_HARD:
         if kw in lower:
-            print(f"[assess] URGENT via keyword: '{kw}'")
+            print(f"[keyword] URGENT via: '{kw}'")
             return "URGENT"
 
     for kw in MONITOR_HARD:
         if kw in lower:
-            print(f"[assess] MONITOR via keyword: '{kw}'")
+            print(f"[keyword] MONITOR via: '{kw}'")
             return "MONITOR"
 
-    # ── 2. Pain score ───────────────────────────────────────────────
     score = extract_pain_score(lower)
     if score is not None:
-        if score >= 8:
-            return "URGENT"
-        if score >= 4:
-            return "MONITOR"
-        # 1-3 → STABLE, fall through to AI for confirmation
+        if score >= 8:  return "URGENT"
+        if score >= 4:  return "MONITOR"
+        if score <= 3:  return "STABLE"
 
-    # ── 3. AI classification ────────────────────────────────────────
-    try:
-        prompt = (
-            "You are a clinical triage assistant.\n"
-            "A patient said: \"{text}\"\n\n"
-            "Classify their condition as exactly one of: URGENT, MONITOR, STABLE\n\n"
-            "URGENT = life-threatening emergency: severe chest pain, cannot breathe, "
-            "unconscious, uncontrolled bleeding, seizure, stroke symptoms.\n"
-            "MONITOR = moderate concern needing attention soon: moderate pain (4-7/10), "
-            "fever, dizziness, nausea, shortness of breath, confusion.\n"
-            "STABLE = mild or no symptoms: low pain (1-3/10), feeling okay, minor discomfort.\n\n"
-            "IMPORTANT: Only classify as URGENT if there are very clear emergency signals. "
-            "When in doubt between URGENT and MONITOR, choose MONITOR. "
-            "When in doubt between MONITOR and STABLE, choose STABLE.\n"
-            "If the response is vague, unclear, or doesn't describe symptoms, reply: STABLE\n\n"
-            "Reply with ONLY one word: URGENT, MONITOR, or STABLE"
-        ).format(text=text)
-
-        r = requests.post(
-            OLLAMA_URL,
-            json={
-                "model": TEXT_MODEL,
-                "prompt": prompt,
-                "stream": False,
-                "options": {
-                    "temperature": 0.0,
-                    "num_predict": 5,
-                    "num_ctx": 512,
-                    "keep_alive": "-1"
-                }
-            },
-            timeout=30
-        )
-
-        result = r.json()["response"].strip().upper().split("\n")[0]
-        print(f"[assess] AI says: {result}")
-
-        if "URGENT" in result:
-            return "URGENT"
-        if "MONITOR" in result:
-            return "MONITOR"
-        return "STABLE"
-
-    except Exception as e:
-        print(f"[assess] AI classification failed, defaulting STABLE: {e}")
-        return "STABLE"
+    return None   # uncertain — let Phi3 handle it
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -168,7 +110,7 @@ def welcome():
 
 
 # ═══════════════════════════════════════════════════════════════════
-# TRANSCRIBE
+# TRANSCRIBE  (Whisper only — no Phi3)
 # ═══════════════════════════════════════════════════════════════════
 
 @app.route("/transcribe", methods=["POST"])
@@ -182,61 +124,88 @@ def transcribe():
             path,
             fp16=False,
             language="en",
-            condition_on_previous_text=False,   # prevents hallucination loops
-            no_speech_threshold=0.6,            # more aggressive silence rejection
-            logprob_threshold=-1.0,             # drop low-confidence words
+            condition_on_previous_text=False,
+            no_speech_threshold=0.6,
+            logprob_threshold=-1.0,
         )
-        text   = result["text"].strip()
-        status = assess(text)
+        text = result["text"].strip()
         os.remove(path)
 
-        if len(text) == 0:
-            return jsonify({"text": "", "status": "STABLE", "heard": False})
+        if not text:
+            return jsonify({"text": "", "heard": False})
 
-        print(f"[transcribe] '{text}' → {status}")
-        return jsonify({"text": text, "status": status, "heard": True})
+        print(f"[transcribe] '{text}'")
+        return jsonify({"text": text, "heard": True})
 
     except Exception as e:
         print(f"[transcribe] Error: {e}")
-        return jsonify({"text": "", "status": "STABLE", "heard": False})
+        return jsonify({"text": "", "heard": False})
 
 
 # ═══════════════════════════════════════════════════════════════════
-# NEXT QUESTION
+# ASSESS + NEXT QUESTION  (single Phi3 call)
 # ═══════════════════════════════════════════════════════════════════
 
-@app.route("/next_question", methods=["POST"])
-def next_question():
+@app.route("/assess_and_next", methods=["POST"])
+def assess_and_next():
+    """
+    Replaces two separate endpoints (/transcribe assess + /next_question).
+
+    Receives:
+      {
+        "history": [{"q": "...", "a": "...", "status": "..."}, ...],
+        "last_answer": "the patient's most recent answer text"
+      }
+
+    Returns:
+      {
+        "status":   "URGENT" | "MONITOR" | "STABLE",
+        "question": "next question text"  |  "DONE"
+      }
+
+    Fast path: if keywords resolve the status unambiguously, we still
+    call Phi3 once for the question but skip the classification prompt.
+    If keywords are uncertain, one Phi3 call returns BOTH fields via JSON.
+    """
     try:
-        history = request.get_json()["history"]
+        body        = request.get_json()
+        history     = body.get("history", [])
+        last_answer = body.get("last_answer", "").strip()
+
+        # ── Fast-path keyword classification ──────────────────────
+        fast_status = keyword_status(last_answer)
 
         history_text = "\n".join([
             f"Nurse: {qa['q']}\nPatient: {qa['a']}"
             for qa in history
         ])
 
+        if fast_status is not None:
+            # Status is settled — only ask Phi3 for the next question
+            question = _get_next_question_only(history_text, history)
+            print(f"[assess_and_next] fast={fast_status} | q='{question}'")
+            return jsonify({"status": fast_status, "question": question})
+
+        # ── Slow path: one Phi3 call for both ─────────────────────
         prompt = (
-            "You are a calm triage assistant.\n"
-            "Ask ONE short follow-up question.\n"
-            "Ask the most pertinent missing question.\n"
-            "Do not repeat questions.\n"
-            "Do not ask for info already given.\n"
-            "Use simple everyday words.\n"
-            "Be clear and specific.\n"
-            "Do not sound robotic.\n"
-            "Do not explain anything.\n"
-            "Do not ask multiple questions.\n\n"
-            "Make Small Questions that are under 15 words. preferably under 10 words. However the response should not cut off, if u have to go to like 16 or 17 words do so it the question is important and will not be cut off.\n"
-            "You need to learn:\n"
-            "- Main problem\n"
-            "- Pain level\n"
-            "- How long it has been happening\n"
-            "- Breathing problems\n"
-            "- Medical conditions\n"
-            "- Medications\n\n"
-            "If enough info is collected, reply ONLY with: DONE\n\n"
-            f"Conversation:\n{history_text}\n\n"
-            "Assistant:"
+            "You are a clinical triage assistant for a nurse robot.\n\n"
+            f"Conversation so far:\n{history_text}\n\n"
+            f"The patient's latest answer: \"{last_answer}\"\n\n"
+            "Your job:\n"
+            "1. Classify the patient's latest answer as URGENT, MONITOR, or STABLE.\n"
+            "   URGENT = life-threatening: severe chest pain, cannot breathe, unconscious, "
+            "uncontrolled bleeding, seizure, stroke, pain 9-10/10.\n"
+            "   MONITOR = moderate concern: pain 4-8/10, fever, dizziness, nausea, "
+            "shortness of breath, confusion.\n"
+            "   STABLE = mild or no symptoms: pain 1-3/10, feeling okay.\n"
+            "   When in doubt, choose the less severe option.\n\n"
+            "2. Ask the single most important follow-up question not yet covered.\n"
+            "   Topics to cover: main problem, pain level, duration, breathing, "
+            "medical history, medications.\n"
+            "   If you have enough info, write DONE instead of a question.\n"
+            "   Keep questions under 15 words. Ask only one question.\n\n"
+            "Reply with ONLY valid JSON, no extra text, no markdown:\n"
+            "{\"status\": \"URGENT|MONITOR|STABLE\", \"question\": \"your question or DONE\"}"
         )
 
         r = requests.post(
@@ -247,7 +216,7 @@ def next_question():
                 "stream": False,
                 "options": {
                     "temperature": 0.1,
-                    "num_predict": 20,
+                    "num_predict": 60,
                     "num_ctx": 1024,
                     "repeat_penalty": 1.3,
                     "top_k": 20,
@@ -258,45 +227,44 @@ def next_question():
             timeout=60
         )
 
-        raw      = r.json()["response"].strip()
-        question = raw.split("\n")[0].strip()
+        raw = r.json()["response"].strip()
+        print(f"[assess_and_next] raw='{raw}'")
 
-        filler_prefixes = [
-            "I'm glad to hear that.", "I'm glad to hear that!",
-            "Great!", "Good!", "Good to know.", "Okay,", "Okay.",
-            "I see.", "I see,", "Alright,", "Alright.", "Sure,",
-            "Thank you.", "Thank you!", "Got it.", "Got it,",
-            "Of course.", "Of course!", "Certainly.", "Certainly!",
-            "Understood.", "Understood,", "Noted.", "Noted,",
-            "I understand.", "I understand,", "That's good.", "That's good!",
-            "That's helpful.", "That's helpful!", "Thanks for sharing.",
-        ]
-        for filler in filler_prefixes:
-            if question.lower().startswith(filler.lower()):
-                question = question[len(filler):].strip()
+        # Strip markdown fences if Phi3 adds them
+        raw = re.sub(r"```json|```", "", raw).strip()
 
-        # Hard cut at first question mark
-        if "?" in question:
-            question = question[:question.index("?") + 1].strip()
+        # Try to parse JSON
+        try:
+            parsed   = json.loads(raw)
+            status   = parsed.get("status",   "STABLE").upper().strip()
+            question = parsed.get("question", "DONE").strip()
+        except json.JSONDecodeError:
+            # Phi3 didn't return clean JSON — extract with regex
+            print(f"[assess_and_next] JSON parse failed, extracting with regex")
+            status   = _extract_status_from_text(raw)
+            question = _extract_question_from_text(raw)
 
-        print(f"[next_question] {question}")
-        return jsonify({"question": question})
+        # Sanitise status
+        if status not in ("URGENT", "MONITOR", "STABLE"):
+            status = "STABLE"
+
+        # Sanitise question — strip filler, cut at first ?
+        question = _clean_question(question)
+
+        print(f"[assess_and_next] status={status} | q='{question}'")
+        return jsonify({"status": status, "question": question})
 
     except Exception as e:
-        print(f"[next_question] Error: {e}")
-        return jsonify({"question": "DONE"})
+        print(f"[assess_and_next] Error: {e}")
+        return jsonify({"status": "STABLE", "question": "DONE"})
 
 
 # ═══════════════════════════════════════════════════════════════════
-# FLAG URGENT
+# FLAG URGENT  (final holistic check — unchanged)
 # ═══════════════════════════════════════════════════════════════════
 
 @app.route("/flag_urgent", methods=["POST"])
 def flag_urgent():
-    """
-    Final holistic pass over the full conversation.
-    Much stricter than per-answer assess() — only fires on clear emergencies.
-    """
     try:
         history = request.get_json()["history"]
 
@@ -305,14 +273,11 @@ def flag_urgent():
             for qa in history
         ])
 
-        # Count how many answers were already flagged URGENT
         urgent_count  = sum(1 for qa in history if qa.get("status") == "URGENT")
         monitor_count = sum(1 for qa in history if qa.get("status") == "MONITOR")
 
-        # Quick exit: if nothing was flagged URGENT during Q&A, skip the AI call
-        # unless 3+ MONITOR flags — then still check
         if urgent_count == 0 and monitor_count < 3:
-            print(f"[flag_urgent] No urgent signals during Q&A (U:{urgent_count} M:{monitor_count}) — skipping AI, returning False")
+            print(f"[flag_urgent] No urgent signals (U:{urgent_count} M:{monitor_count}) — skipping AI")
             return jsonify({"flagged_urgent": False})
 
         prompt = (
@@ -353,14 +318,98 @@ def flag_urgent():
         )
 
         result  = r.json()["response"].strip().upper().split("\n")[0]
-        flagged = result.startswith("YES")   # stricter match than "YES" in result
-
+        flagged = result.startswith("YES")
         print(f"[flag_urgent] AI says: {result} → flagged={flagged}")
         return jsonify({"flagged_urgent": flagged})
 
     except Exception as e:
         print(f"[flag_urgent] Error: {e}")
         return jsonify({"flagged_urgent": False})
+
+
+# ═══════════════════════════════════════════════════════════════════
+# HELPERS
+# ═══════════════════════════════════════════════════════════════════
+
+def _get_next_question_only(history_text, history):
+    """Called on the fast path — status already known, just need next Q."""
+    prompt = (
+        "You are a calm triage assistant.\n"
+        "Ask ONE short follow-up question.\n"
+        "Ask the most pertinent missing question.\n"
+        "Do not repeat questions already asked.\n"
+        "Use simple everyday words. Be clear and specific.\n"
+        "Keep it under 15 words.\n"
+        "Topics to cover: main problem, pain level, duration, "
+        "breathing problems, medical conditions, medications.\n"
+        "If enough info is collected, reply ONLY with: DONE\n\n"
+        f"Conversation:\n{history_text}\n\n"
+        "Assistant:"
+    )
+
+    try:
+        r = requests.post(
+            OLLAMA_URL,
+            json={
+                "model": TEXT_MODEL,
+                "prompt": prompt,
+                "stream": False,
+                "options": {
+                    "temperature": 0.1,
+                    "num_predict": 20,
+                    "num_ctx": 1024,
+                    "repeat_penalty": 1.3,
+                    "top_k": 20,
+                    "top_p": 0.8,
+                    "keep_alive": "-1"
+                }
+            },
+            timeout=60
+        )
+        raw = r.json()["response"].strip().split("\n")[0].strip()
+        return _clean_question(raw)
+    except Exception as e:
+        print(f"[next_question_only] Error: {e}")
+        return "DONE"
+
+
+FILLER_PREFIXES = [
+    "I'm glad to hear that.", "I'm glad to hear that!",
+    "Great!", "Good!", "Good to know.", "Okay,", "Okay.",
+    "I see.", "I see,", "Alright,", "Alright.", "Sure,",
+    "Thank you.", "Thank you!", "Got it.", "Got it,",
+    "Of course.", "Of course!", "Certainly.", "Certainly!",
+    "Understood.", "Understood,", "Noted.", "Noted,",
+    "I understand.", "I understand,", "That's good.", "That's good!",
+    "That's helpful.", "That's helpful!", "Thanks for sharing.",
+]
+
+def _clean_question(question):
+    for filler in FILLER_PREFIXES:
+        if question.lower().startswith(filler.lower()):
+            question = question[len(filler):].strip()
+    if "?" in question:
+        question = question[:question.index("?") + 1].strip()
+    return question
+
+
+def _extract_status_from_text(text):
+    for s in ("URGENT", "MONITOR", "STABLE"):
+        if s in text.upper():
+            return s
+    return "STABLE"
+
+
+def _extract_question_from_text(text):
+    # Look for anything after "question": in the raw text
+    match = re.search(r'"question"\s*:\s*"([^"]+)"', text)
+    if match:
+        return _clean_question(match.group(1))
+    # Fall back: find the first sentence ending in ?
+    match = re.search(r'([A-Z][^?]+\?)', text)
+    if match:
+        return _clean_question(match.group(1).strip())
+    return "DONE"
 
 
 # ═══════════════════════════════════════════════════════════════════
