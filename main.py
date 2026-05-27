@@ -6,6 +6,8 @@ Navigates corridor, detects room openings, enters room,
 then launches client.py to begin the patient assessment.
 """
 
+import json
+import os
 import time
 import subprocess   # ← ADDED: to launch client.py after entering room
 import ydlidar
@@ -16,13 +18,16 @@ import lidarHelpers
 from lidarHelpers import get_stable_distances
 from datetime import datetime
 
+PATIENT_INFO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "modules", "logs", "patientINFO.json")
+
+
 # --- Constants --- (UNCHANGED)
 LIDAR_PORT              = "/dev/lidar"
 OBSTACLE_THRESHOLD_CM   = 45
 OPENING_INCREASE_CM     = 12
 
 # --- Turn-and-enter constants (UNCHANGED) ---
-TURN_DURATION_SEC       = 1  # Adjust as needed for a 90° turn at your speed
+TURN_DURATION_SEC       = 0.8  # Adjust as needed for a 90° turn at your speed
 ENTER_SPEED             = 100
 ENTER_DURATION_SEC      = 1
 ENTER_ROOM_THRESHOLD_CM = 45
@@ -119,8 +124,7 @@ def enter_room(side, laser, lcd=None):
 def start_patient_assessment(lcd=None):
     """
     Launch client.py as a subprocess to begin the patient triage session.
-    This blocks until the full assessment is complete before navigation resumes.
-    The LCD shows ASSESSING while it runs.
+    After assessment completes, HALT navigation and display triage result forever.
     """
     print("[assessment] Launching patient assessment (client.py)...")
 
@@ -133,21 +137,53 @@ def start_patient_assessment(lcd=None):
         lcd.cursor_pos = (2, 0)
         lcd.write_string("IN PROGRESS...".ljust(20))
 
-    # Run client.py and wait for it to finish before continuing navigation
     result = subprocess.run(["python3", "client.py"], check=False)
 
     if result.returncode == 0:
         print("[assessment] Assessment completed successfully.")
     else:
-        print(f"[assessment] client.py exited with code {result.returncode} — continuing navigation.")
+        print(f"[assessment] client.py exited with code {result.returncode}.")
 
+    # --- Read the last triage result from the log ---
+    status = "COMPLETE"
+    flagged = False
+
+    try:
+        if os.path.exists(PATIENT_INFO_PATH):
+            with open(PATIENT_INFO_PATH, "r") as f:
+                all_records = json.load(f)
+            if all_records:
+                last = all_records[-1]
+                status  = last.get("triage", {}).get("final_status", "COMPLETE")
+                flagged = last.get("triage", {}).get("flagged_urgent", False)
+    except Exception as e:
+        print(f"[assessment] Could not read triage result: {e}")
+
+    # --- Stop motors permanently ---
+    motors.stop()
+    print("[assessment] Navigation halted. Displaying triage result indefinitely.")
+
+    # --- Display result forever ---
     if lcd:
-        lcd.clear()
-        lcd.cursor_pos = (0, 0)
-        lcd.write_string("ASSESSMENT DONE".ljust(20))
-        lcd.cursor_pos = (1, 0)
-        lcd.write_string("RESUMING NAV...".ljust(20))
-        time.sleep(2)
+        while True:
+            lcd.clear()
+            lcd.cursor_pos = (0, 0)
+            lcd.write_string("== TRIAGE STATUS ==")
+            lcd.cursor_pos = (1, 0)
+            lcd.write_string(f"Result: {status}".ljust(20)[:20])
+            lcd.cursor_pos = (2, 0)
+            if flagged:
+                lcd.write_string("!! NURSE ALERTED !!".ljust(20))
+            else:
+                lcd.write_string("Assessment Done".ljust(20))
+            lcd.cursor_pos = (3, 0)
+            lcd.write_string("Session Complete".ljust(20))
+            time.sleep(5)  # Refresh every 5s in case of LCD glitch
+    else:
+        # No LCD — just block forever with a print loop
+        while True:
+            print(f"[assessment] Triage result: {status} | Urgent: {flagged}")
+            time.sleep(10)
 
 
 # ═══════════════════════════════════════════════════════════════════

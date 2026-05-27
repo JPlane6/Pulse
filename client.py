@@ -32,7 +32,7 @@ AUDIO_DEVICE_KEYWORD = "USB"
 PIPER_MODEL          = "/home/ayushs0604/Pulse/en_US-hfc_female-medium.onnx"
 
 BARGE_IN_ENABLED     = False
-VAD_THRESHOLD        = 0.90
+VAD_THRESHOLD        = 0.70
 BARGE_IN_IGNORE_SECS = 6.0
 
 LED_RED_PIN          = 17
