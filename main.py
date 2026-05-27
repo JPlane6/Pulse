@@ -4,12 +4,19 @@ Hospital Gallery Navigation Robot
 ===================================
 Navigates corridor, detects room openings, enters room,
 then launches client.py to begin the patient assessment.
+
+BOOT ORDER (parallel):
+  Thread A — LCD hello animation
+  Thread B — Arduino connect (replaces blocking sleep with READY handshake)
+  Thread C — LiDAR initialize + turnOn
+All three run simultaneously. Main blocks until all three finish.
 """
 
 import json
 import os
 import time
-import subprocess   # ← ADDED: to launch client.py after entering room
+import threading
+import subprocess
 import ydlidar
 from RPLCD.i2c import CharLCD
 import lcd_hello
@@ -20,21 +27,17 @@ from datetime import datetime
 
 PATIENT_INFO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "modules", "logs", "patientINFO.json")
 
-
-# --- Constants --- (UNCHANGED)
 LIDAR_PORT              = "/dev/lidar"
 OBSTACLE_THRESHOLD_CM   = 45
 OPENING_INCREASE_CM     = 12
-
-# --- Turn-and-enter constants (UNCHANGED) ---
-TURN_DURATION_SEC       = 0.8  # Adjust as needed for a 90° turn at your speed
+TURN_DURATION_SEC       = 0.8
 ENTER_SPEED             = 85
 ENTER_DURATION_SEC      = 1
 ENTER_ROOM_THRESHOLD_CM = 45
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  LCD HELPERS (UNCHANGED)
+#  LCD HELPERS
 # ═══════════════════════════════════════════════════════════════════
 
 def update_lcd(lcd, left_cm, right_cm, front_cm, status_line):
@@ -66,7 +69,7 @@ def log_distances(front_cm, left_cm, right_cm):
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  MOVEMENT HELPERS (UNCHANGED)
+#  MOVEMENT HELPERS
 # ═══════════════════════════════════════════════════════════════════
 
 def move_forward_until_obstacle(laser, lcd=None, threshold_cm=25, speed=ENTER_SPEED):
@@ -100,10 +103,6 @@ def move_forward_until_obstacle(laser, lcd=None, threshold_cm=25, speed=ENTER_SP
 
 
 def enter_room(side, laser, lcd=None):
-    """
-    Stop, turn 90° toward the opening
-    side: 'L' or 'R'
-    """
     print(f"[enter_room] Turning {side} into opening...")
     if lcd:
         lcd.cursor_pos = (3, 0)
@@ -111,31 +110,21 @@ def enter_room(side, laser, lcd=None):
 
     motors.go()
     motors.turn(side, TURN_DURATION_SEC)
-
-
     print(f"[enter_room] Entered room.")
 
 
 # ═══════════════════════════════════════════════════════════════════
 #  PATIENT ASSESSMENT TRIGGER
-#  ← NEW: called after robot enters a room
 # ═══════════════════════════════════════════════════════════════════
 
 def start_patient_assessment(lcd=None):
-    """
-    Launch client.py as a subprocess to begin the patient triage session.
-    After assessment completes, HALT navigation and display triage result forever.
-    """
     print("[assessment] Launching patient assessment (client.py)...")
 
     if lcd:
         lcd.clear()
-        lcd.cursor_pos = (0, 0)
-        lcd.write_string("PATIENT".ljust(20))
-        lcd.cursor_pos = (1, 0)
-        lcd.write_string("ASSESSMENT".ljust(20))
-        lcd.cursor_pos = (2, 0)
-        lcd.write_string("IN PROGRESS...".ljust(20))
+        lcd.cursor_pos = (0, 0); lcd.write_string("PATIENT".ljust(20))
+        lcd.cursor_pos = (1, 0); lcd.write_string("ASSESSMENT".ljust(20))
+        lcd.cursor_pos = (2, 0); lcd.write_string("IN PROGRESS...".ljust(20))
 
     result = subprocess.run(["python3", "client.py"], check=False)
 
@@ -144,8 +133,7 @@ def start_patient_assessment(lcd=None):
     else:
         print(f"[assessment] client.py exited with code {result.returncode}.")
 
-    # --- Read the last triage result from the log ---
-    status = "COMPLETE"
+    status  = "COMPLETE"
     flagged = False
 
     try:
@@ -153,37 +141,125 @@ def start_patient_assessment(lcd=None):
             with open(PATIENT_INFO_PATH, "r") as f:
                 all_records = json.load(f)
             if all_records:
-                last = all_records[-1]
+                last    = all_records[-1]
                 status  = last.get("triage", {}).get("final_status", "COMPLETE")
                 flagged = last.get("triage", {}).get("flagged_urgent", False)
     except Exception as e:
         print(f"[assessment] Could not read triage result: {e}")
 
-    # --- Stop motors permanently ---
     motors.stop()
     print("[assessment] Navigation halted. Displaying triage result indefinitely.")
 
-    # --- Display result forever ---
     if lcd:
         while True:
             lcd.clear()
-            lcd.cursor_pos = (0, 0)
-            lcd.write_string("== TRIAGE STATUS ==")
-            lcd.cursor_pos = (1, 0)
-            lcd.write_string(f"Result: {status}".ljust(20)[:20])
+            lcd.cursor_pos = (0, 0); lcd.write_string("== TRIAGE STATUS ==")
+            lcd.cursor_pos = (1, 0); lcd.write_string(f"Result: {status}".ljust(20)[:20])
             lcd.cursor_pos = (2, 0)
             if flagged:
                 lcd.write_string("!! NURSE ALERTED !!".ljust(20))
             else:
                 lcd.write_string("Assessment Done".ljust(20))
-            lcd.cursor_pos = (3, 0)
-            lcd.write_string("Session Complete".ljust(20))
-            time.sleep(5)  # Refresh every 5s in case of LCD glitch
+            lcd.cursor_pos = (3, 0); lcd.write_string("Session Complete".ljust(20))
+            time.sleep(5)
     else:
-        # No LCD — just block forever with a print loop
         while True:
             print(f"[assessment] Triage result: {status} | Urgent: {flagged}")
             time.sleep(10)
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  PARALLEL BOOT
+# ═══════════════════════════════════════════════════════════════════
+
+def _boot_lcd(results, errors):
+    """Thread A: LCD init + hello animation."""
+    try:
+        lcd = CharLCD("PCF8574", 0x27, cols=20, rows=4)
+        lcd.clear()
+        lcd_hello.hello()          # runs the 5-second animation
+        results["lcd"] = lcd
+        print("[boot] LCD ready")
+    except Exception as e:
+        errors["lcd"] = e
+        print(f"[boot] LCD failed: {e}")
+
+
+def _boot_arduino(results, errors):
+    """Thread B: Arduino serial connect (READY handshake, no fixed sleep)."""
+    try:
+        motors.connect()           # our new lazy-init connect()
+        results["arduino"] = True
+        print("[boot] Arduino ready")
+    except Exception as e:
+        errors["arduino"] = e
+        print(f"[boot] Arduino failed: {e}")
+
+
+def _boot_lidar(results, errors):
+    """Thread C: LiDAR initialize + motor spin-up."""
+    try:
+        laser = ydlidar.CYdLidar()
+        laser.setlidaropt(ydlidar.LidarPropSerialPort, LIDAR_PORT)
+        laser.setlidaropt(ydlidar.LidarPropSerialBaudrate, 128000)
+        laser.setlidaropt(ydlidar.LidarPropLidarType, ydlidar.TYPE_TRIANGLE)
+        laser.setlidaropt(ydlidar.LidarPropDeviceType, ydlidar.YDLIDAR_TYPE_SERIAL)
+        laser.setlidaropt(ydlidar.LidarPropSingleChannel, True)
+        laser.setlidaropt(ydlidar.LidarPropSampleRate, 5)
+        laser.setlidaropt(ydlidar.LidarPropScanFrequency, 12.0)
+
+        if not laser.initialize():
+            raise RuntimeError("LiDAR initialize() failed")
+        if not laser.turnOn():
+            raise RuntimeError("LiDAR turnOn() failed")
+
+        results["laser"] = laser
+        print("[boot] LiDAR ready")
+    except Exception as e:
+        errors["lidar"] = e
+        print(f"[boot] LiDAR failed: {e}")
+
+
+def parallel_boot():
+    """
+    Kick off LCD, Arduino, and LiDAR init simultaneously.
+    Returns (lcd, laser) once all three threads finish.
+    Raises RuntimeError if any critical component failed.
+    """
+    results = {}
+    errors  = {}
+
+    t_lcd     = threading.Thread(target=_boot_lcd,     args=(results, errors), daemon=True)
+    t_arduino = threading.Thread(target=_boot_arduino, args=(results, errors), daemon=True)
+    t_lidar   = threading.Thread(target=_boot_lidar,   args=(results, errors), daemon=True)
+
+    boot_start = time.time()
+    t_lcd.start()
+    t_arduino.start()
+    t_lidar.start()
+
+    # Wait for all three — LCD hello is 5s so that's the natural gate
+    t_lcd.join()
+    t_arduino.join()
+    t_lidar.join()
+
+    elapsed = time.time() - boot_start
+    print(f"[boot] All components ready in {elapsed:.1f}s")
+
+    if "lcd" in errors:
+        raise RuntimeError(f"LCD failed: {errors['lcd']}")
+    if "arduino" in errors:
+        raise RuntimeError(f"Arduino failed: {errors['arduino']}")
+    if "lidar" in errors:
+        lcd = results.get("lcd")
+        if lcd:
+            lcd.clear()
+            lcd.write_string("LIDAR INIT ERROR".ljust(20))
+            lcd.cursor_pos = (1, 0)
+            lcd.write_string(LIDAR_PORT.ljust(20)[:20])
+        raise RuntimeError(f"LiDAR failed: {errors['lidar']}")
+
+    return results["lcd"], results["laser"]
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -191,35 +267,11 @@ def start_patient_assessment(lcd=None):
 # ═══════════════════════════════════════════════════════════════════
 
 def main():
+    # ── Parallel boot ──────────────────────────────────────────────
     try:
-        lcd = CharLCD("PCF8574", 0x27, cols=20, rows=4)
-    except Exception:
-        print("[main] ERROR: Could not connect to LCD.")
-        return
-
-    lcd.clear()
-    lcd_hello.hello()
-
-    # --- LiDAR setup (UNCHANGED) ---
-    laser = ydlidar.CYdLidar()
-    laser.setlidaropt(ydlidar.LidarPropSerialPort, LIDAR_PORT)
-    laser.setlidaropt(ydlidar.LidarPropSerialBaudrate, 128000)
-    laser.setlidaropt(ydlidar.LidarPropLidarType, ydlidar.TYPE_TRIANGLE)
-    laser.setlidaropt(ydlidar.LidarPropDeviceType, ydlidar.YDLIDAR_TYPE_SERIAL)
-    laser.setlidaropt(ydlidar.LidarPropSingleChannel, True)
-    laser.setlidaropt(ydlidar.LidarPropSampleRate, 5)
-    laser.setlidaropt(ydlidar.LidarPropScanFrequency, 12.0)
-
-    if not laser.initialize():
-        lcd.clear()
-        lcd.write_string("LIDAR INIT ERROR".ljust(20))
-        lcd.cursor_pos = (1, 0)
-        lcd.write_string(LIDAR_PORT.ljust(20)[:20])
-        return
-
-    if not laser.turnOn():
-        lcd.clear()
-        lcd.write_string("LIDAR MOTOR ERROR".ljust(20))
+        lcd, laser = parallel_boot()
+    except RuntimeError as e:
+        print(f"[main] BOOT FAILED: {e}")
         return
 
     scan = ydlidar.LaserScan()
@@ -241,13 +293,10 @@ def main():
 
     try:
         while True:
-            # ─────────────────────────────────────────────────────────────
-            # FAST SCAN: Check front obstacle first, every loop iteration
-            # ─────────────────────────────────────────────────────────────
+            # ── FAST SCAN: front obstacle check every loop ─────────
             if laser.doProcessSimple(scan):
                 front_cm_fast, _, _ = lidarHelpers.get_all_distances(scan, debug=False)
 
-                # PRIORITY 1: EMERGENCY STOP — obstacle too close
                 if front_cm_fast is not None and front_cm_fast < OBSTACLE_THRESHOLD_CM:
                     if motor_state != "STOPPED":
                         motors.stop()
@@ -267,7 +316,7 @@ def main():
                                 cmd = f"MOVE F {ENTER_SPEED} 9999\n"
                                 motors.arduino.write(cmd.encode('utf-8'))
                                 motors.wait_for("MOVING", timeout=3)
-                                motor_state = "MOVING"
+                                motor_state   = "MOVING"
                                 prev_front_cm = None
                                 break
                             if laser.doProcessSimple(scan):
@@ -276,11 +325,10 @@ def main():
                                 update_lcd(lcd, left_cm, right_cm, front_cm, "OBSTACLE - STOPPED")
                     continue
 
-                # FAILSAFE: reading disappeared while close — likely too close to detect
                 elif front_cm_fast is None and prev_front_cm is not None and prev_front_cm < OBSTACLE_THRESHOLD_CM:
                     if motor_state != "STOPPED":
                         motors.stop()
-                        motor_state = "STOPPED"
+                        motor_state   = "STOPPED"
                         print(f"[main] EMERGENCY STOP - Obstacle too close (lost at {prev_front_cm:.1f}cm)")
 
                     front_cm, left_cm, right_cm = get_stable_distances(laser, scan, num_scans=2)
@@ -296,7 +344,7 @@ def main():
                                 cmd = f"MOVE F {ENTER_SPEED} 9999\n"
                                 motors.arduino.write(cmd.encode('utf-8'))
                                 motors.wait_for("MOVING", timeout=3)
-                                motor_state = "MOVING"
+                                motor_state   = "MOVING"
                                 prev_front_cm = None
                                 break
                             time.sleep(0.1)
@@ -304,13 +352,10 @@ def main():
 
                 prev_front_cm = front_cm_fast
 
-            # ─────────────────────────────────────────────────────────────
-            # STABLE SCAN: used for opening detection and display
-            # ─────────────────────────────────────────────────────────────
+            # ── STABLE SCAN: opening detection + display ───────────
             front_cm, left_cm, right_cm = get_stable_distances(laser, scan, num_scans=2)
             log_distances(front_cm, left_cm, right_cm)
 
-            # PRIORITY 2: LEFT OPENING DETECTED
             if (prev_left_cm is not None and
                     left_cm < 999.0 and
                     left_cm - prev_left_cm > OPENING_INCREASE_CM and
@@ -320,10 +365,7 @@ def main():
                 motors.stop()
                 update_lcd(lcd, left_cm, right_cm, front_cm, "OPENING LEFT!")
                 time.sleep(0.3)
-
                 enter_room('L', laser, lcd)
-
-                # ← NEW: assessment starts here, blocks until done
                 start_patient_assessment(lcd)
 
                 prev_left_cm   = left_cm
@@ -331,7 +373,6 @@ def main():
                 last_turn_time = time.time()
                 motor_state    = "MOVING"
 
-            # PRIORITY 3: RIGHT OPENING DETECTED
             elif (prev_right_cm is not None and
                     right_cm < 999.0 and
                     right_cm - prev_right_cm > OPENING_INCREASE_CM and
@@ -341,10 +382,7 @@ def main():
                 motors.stop()
                 update_lcd(lcd, left_cm, right_cm, front_cm, "OPENING RIGHT!")
                 time.sleep(0.3)
-
                 enter_room('R', laser, lcd)
-
-                # ← NEW: assessment starts here, blocks until done
                 start_patient_assessment(lcd)
 
                 prev_right_cm  = right_cm
@@ -352,7 +390,6 @@ def main():
                 last_turn_time = time.time()
                 motor_state    = "MOVING"
 
-            # PRIORITY 4: DEFAULT — go straight
             else:
                 update_lcd(lcd, left_cm, right_cm, front_cm, "GOING STRAIGHT")
                 if motor_state != "MOVING":

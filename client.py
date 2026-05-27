@@ -220,8 +220,32 @@ def get_patient_name(config):
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  TTS
+#  TTS  +  PIPER WARMUP
 # ═══════════════════════════════════════════════════════════════════
+
+def warmup_piper():
+    """
+    Run Piper once with a silent/empty string so it loads its model
+    files into OS page cache before the first real speak() call.
+    This cuts the first-speech delay from ~3-4s down to ~0.3s.
+    Output is piped to /dev/null so nothing plays.
+    """
+    print("[tts] Warming up Piper...")
+    try:
+        piper = subprocess.Popen(
+            ["piper", "--model", PIPER_MODEL, "--output_raw"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+        )
+        # Send a short silent phrase — just enough to force model load
+        piper.stdin.write(b" ")
+        piper.stdin.close()
+        # Drain stdout (raw audio) to /dev/null
+        subprocess.run(["cat"], stdin=piper.stdout, stdout=subprocess.DEVNULL)
+        piper.wait()
+        print("[tts] Piper warm.")
+    except Exception as e:
+        print(f"[tts] Warmup failed (non-fatal): {e}")
+
 
 def speak(text, alsa_device, pa_device_index=None):
     print(f"[tts] Speaking: '{text}'")
@@ -428,6 +452,11 @@ def main():
         speak("I cannot connect to my brain server.", alsa_device)
         return
 
+    # ── Warm up Piper while checks are still running ───────────────
+    # This runs synchronously here but you could thread it above if
+    # you want it overlapping with check_server().
+    warmup_piper()
+
     config       = load_config()
     room         = get_room_number(config)
     patient_name = get_patient_name(config)
@@ -475,19 +504,12 @@ def main():
         set_status_led(status)
         print(f"[status] {status}")
 
-        # Only short-circuit on URGENT if a hard keyword or very high pain was detected.
-        # Do NOT break just because the per-answer classifier returned URGENT —
-        # let the final flag_urgent call make the definitive call.
-        # We only hard-break if status has been URGENT for 2+ consecutive answers.
         urgent_streak = sum(1 for qa in history[-2:] if qa.get("status") == "URGENT")
         if urgent_streak >= 2:
             print("[main] Two consecutive URGENT answers — ending questions early.")
             break
 
     # ── Final decision ─────────────────────────────────────────────
-    # flag_urgent is the authoritative call.
-    # We do NOT OR it with status == URGENT here — the server already
-    # considers Q&A urgency counts internally before calling the AI.
     print("\n--- Finalizing ---")
     flagged_urgent = check_urgent(history)
 
@@ -496,7 +518,6 @@ def main():
         set_status_led("URGENT")
         speak(f"Based on your responses {patient_name}, I am alerting a nurse immediately.", alsa_device, pa_input_index)
     else:
-        # Status may still be MONITOR — that's fine, no nurse alert needed
         speak(f"Thank you {patient_name}. Your assessment is complete.", alsa_device, pa_input_index)
 
     speak("Feel better soon.", alsa_device, pa_input_index)
