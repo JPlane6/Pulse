@@ -48,7 +48,7 @@ The MacBook handles all the AI. It runs a Flask web server that the Pi sends req
 
 | Part | What It Does |
 |---|---|
-| Raspberry Pi 4 | Runs the robot — navigation, audio, motors, display, logging |
+| Raspberry Pi 5 | Runs the robot — navigation, audio, motors, display, logging |
 | MacBook M2 (16GB RAM) | Runs the AI server — speech to text and question generation |
 | YDLidar X4 | Reads distances in all directions for navigation and room detection |
 | Arduino Mega + Adafruit Motor Shield | Controls the four drive motors based on commands from the Pi |
