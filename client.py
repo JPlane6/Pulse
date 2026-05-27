@@ -499,7 +499,7 @@ def main():
         # Status may still be MONITOR — that's fine, no nurse alert needed
         speak(f"Thank you {patient_name}. Your assessment is complete.", alsa_device, pa_input_index)
 
-    speak("Thank you for your time. Feel better soon.", alsa_device, pa_input_index)
+    speak("Feel better soon.", alsa_device, pa_input_index)
 
     show_status_on_lcd(lcd, status, flagged_urgent)
     save_log(session_dir, {

@@ -28,7 +28,7 @@ OPENING_INCREASE_CM     = 12
 
 # --- Turn-and-enter constants (UNCHANGED) ---
 TURN_DURATION_SEC       = 0.8  # Adjust as needed for a 90° turn at your speed
-ENTER_SPEED             = 100
+ENTER_SPEED             = 85
 ENTER_DURATION_SEC      = 1
 ENTER_ROOM_THRESHOLD_CM = 45
 
