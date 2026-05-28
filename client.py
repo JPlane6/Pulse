@@ -1,5 +1,6 @@
 import sounddevice as sd
 import scipy.io.wavfile as wav
+import scipy.signal as signal
 import requests
 from requests.exceptions import Timeout, ConnectionError
 import tempfile
@@ -8,40 +9,42 @@ import re
 import time
 import subprocess
 import json
+import base64
 import threading
 from datetime import datetime
-import scipy.signal as signal
 import numpy as np
 import torch
-from silero_vad import load_silero_vad, VADIterator
+from silero_vad import load_silero_vad
 
 # ═══════════════════════════════════════════════════════════════════
-#  CRITICAL PI PERFORMANCE TUNING
+#  PI PERFORMANCE TUNING
 # ═══════════════════════════════════════════════════════════════════
 torch.set_num_threads(1)
 torch.set_num_interop_threads(1)
 
 # ═══════════════════════════════════════════════════════════════════
-#  CONFIGURATION
+#  CONFIG
 # ═══════════════════════════════════════════════════════════════════
-
 SERVER_URL           = "http://192.168.0.157:5001"
 MAX_QUESTIONS        = 6
 SAMPLERATE           = 16000
 AUDIO_DEVICE_KEYWORD = "USB"
 PIPER_MODEL          = "/home/ayushs0604/Pulse/en_US-hfc_female-medium.onnx"
 
-BARGE_IN_ENABLED     = False
 VAD_THRESHOLD        = 0.70
-BARGE_IN_IGNORE_SECS = 6.0
-
-LED_RED_PIN          = 17
-LED_GREEN_PIN        = 27
-LED_BLUE_PIN         = 22
-
 VAD_SILENCE_DURATION = 1.5
 VAD_MAX_DURATION     = 15
 VAD_FRAME_SAMPLES    = 512
+RMS_GATE             = 150       # skip VAD call on obviously silent frames
+
+# Streaming TTS chunking — flush to Piper once we have this many words
+# buffered AND we're at a word boundary. Lower = faster first word.
+# Higher = better prosody. 4 is the sweet spot.
+STREAM_CHUNK_WORDS   = 4
+
+LED_RED_PIN   = 17
+LED_GREEN_PIN = 27
+LED_BLUE_PIN  = 22
 
 LOG_DIR           = os.path.join(os.path.dirname(os.path.abspath(__file__)), "modules", "logs")
 PATIENT_INFO_PATH = os.path.join(LOG_DIR, "patientINFO.json")
@@ -52,15 +55,13 @@ os.makedirs(LOG_DIR, exist_ok=True)
 # ═══════════════════════════════════════════════════════════════════
 #  VAD
 # ═══════════════════════════════════════════════════════════════════
-
-print("[vad] Loading Silero VAD framework...")
+print("[vad] Loading Silero VAD...")
 vad_model = load_silero_vad()
-print("[vad] Silero VAD framework loaded.")
+print("[vad] Ready.")
 
 # ═══════════════════════════════════════════════════════════════════
 #  GPIO
 # ═══════════════════════════════════════════════════════════════════
-
 GPIO_AVAILABLE = False
 RED_LINE = GREEN_LINE = BLUE_LINE = None
 
@@ -76,117 +77,71 @@ try:
     RED_LINE.request(consumer="PULSE",   type=gpiod.LINE_REQ_DIR_OUT)
     GREEN_LINE.request(consumer="PULSE", type=gpiod.LINE_REQ_DIR_OUT)
     BLUE_LINE.request(consumer="PULSE",  type=gpiod.LINE_REQ_DIR_OUT)
-    RED_LINE.set_value(0)
-    GREEN_LINE.set_value(0)
-    BLUE_LINE.set_value(0)
+    RED_LINE.set_value(0); GREEN_LINE.set_value(0); BLUE_LINE.set_value(0)
     GPIO_AVAILABLE = True
     print(f"[gpio] Linked via {target_chip}")
 except Exception as e:
-    print(f"[gpio] Bypassed ({e}). Running in simulation mode.")
+    print(f"[gpio] Bypassed ({e}). Simulation mode.")
 
-
-# ═══════════════════════════════════════════════════════════════════
-#  LED
-# ═══════════════════════════════════════════════════════════════════
 
 def set_status_led(status_type):
     if not GPIO_AVAILABLE:
-        print(f"[led-simulation] Status updated to color profile: {status_type}")
+        print(f"[led] {status_type}")
         return
     try:
-        RED_LINE.set_value(0)
-        GREEN_LINE.set_value(0)
-        BLUE_LINE.set_value(0)
-        if status_type == "URGENT":
-            RED_LINE.set_value(1)
-        elif status_type == "MONITOR":
-            BLUE_LINE.set_value(1)
-        else:
-            GREEN_LINE.set_value(1)
+        RED_LINE.set_value(0); GREEN_LINE.set_value(0); BLUE_LINE.set_value(0)
+        if status_type == "URGENT":    RED_LINE.set_value(1)
+        elif status_type == "MONITOR": BLUE_LINE.set_value(1)
+        else:                          GREEN_LINE.set_value(1)
     except Exception as e:
         print(f"[gpio] LED error: {e}")
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  CALIBRATION
+#  AUDIO DEVICE CACHE
+#  Queried once at startup — never again during the session.
 # ═══════════════════════════════════════════════════════════════════
+_native_sr       = None
+_pa_device_index = None
+_resample_up     = None
+_resample_down   = None
+_alsa_device     = None
 
-def run_microphone_calibration(pa_device_index):
-    print("[calibration] Running 2-second mic diagnostic...")
-    try:
-        device_info = sd.query_devices(pa_device_index, "input")
-        native_sr   = int(device_info["default_samplerate"])
-    except Exception:
-        native_sr = 48000
-    try:
-        recording = sd.rec(int(2.0 * native_sr), samplerate=native_sr, channels=1, dtype="int16", device=pa_device_index)
-        sd.wait()
-        rms = np.sqrt(np.mean(recording.flatten().astype(np.float32) ** 2))
-        print(f"[calibration] RMS: {rms:.2f}")
-        if rms < 1.0:
-            print("[calibration] FATAL: No signal energy detected.")
-            return False
-        return True
-    except Exception as e:
-        print(f"[calibration] Failed: {e}")
-        return False
-
-
-# ═══════════════════════════════════════════════════════════════════
-#  BARGE-IN
-# ═══════════════════════════════════════════════════════════════════
-
-def monitor_barge_in(aplay_process, piper_process, pa_device_index):
-    start_time = time.time()
-    try:
-        device_info = sd.query_devices(pa_device_index, "input")
-        native_sr   = int(device_info["default_samplerate"])
-    except Exception:
-        native_sr = 48000
-    hw_blocksize = int(VAD_FRAME_SAMPLES * (native_sr / SAMPLERATE))
-    try:
-        with sd.InputStream(samplerate=native_sr, channels=1, dtype="int16", device=pa_device_index, blocksize=hw_blocksize) as stream:
-            while aplay_process.poll() is None:
-                frame, _ = stream.read(hw_blocksize)
-                if time.time() - start_time < BARGE_IN_IGNORE_SECS:
-                    continue
-                frame_fixed    = np.ascontiguousarray(frame, dtype=np.int16)
-                f32_frame      = frame_fixed.flatten().astype(np.float32) / 32768.0
-                target_samples = int(len(f32_frame) * SAMPLERATE / native_sr)
-                resampled      = signal.resample(f32_frame, target_samples)
-                tensor         = torch.from_numpy(resampled).float()
-                if vad_model(tensor, SAMPLERATE).item() > VAD_THRESHOLD:
-                    print("\n[barge-in] Voice detected — killing playback.")
-                    aplay_process.terminate()
-                    piper_process.terminate()
-                    break
-    except Exception as e:
-        print(f"[barge-in] Error: {e}")
-
-
-# ═══════════════════════════════════════════════════════════════════
-#  AUDIO UTILITIES
-# ═══════════════════════════════════════════════════════════════════
 
 def find_alsa_device():
     try:
         result = subprocess.run(["aplay", "-l"], capture_output=True, text=True, timeout=5)
         for line in result.stdout.splitlines():
             if AUDIO_DEVICE_KEYWORD.lower() in line.lower() and line.startswith("card"):
-                match = re.search(r"card (\d+):", line)
-                if match:
-                    device_str = f"plughw:{match.group(1)},0"
-                    print(f"[audio] ALSA device: {device_str}")
-                    return device_str
+                m = re.search(r"card (\d+):", line)
+                if m:
+                    d = f"plughw:{m.group(1)},0"
+                    print(f"[audio] ALSA: {d}")
+                    return d
     except Exception:
         pass
     return None
+
 
 def find_portaudio_input_device():
     for i, dev in enumerate(sd.query_devices()):
         if AUDIO_DEVICE_KEYWORD.lower() in dev["name"].lower() and dev["max_input_channels"] > 0:
             return i
     return None
+
+
+def init_audio_cache(alsa_dev, pa_index):
+    global _native_sr, _resample_up, _resample_down, _pa_device_index, _alsa_device
+    _alsa_device     = alsa_dev
+    _pa_device_index = pa_index
+    info             = sd.query_devices(pa_index, "input")
+    _native_sr       = int(info["default_samplerate"])
+    from math import gcd
+    g              = gcd(SAMPLERATE, _native_sr)
+    _resample_up   = SAMPLERATE  // g
+    _resample_down = _native_sr  // g
+    print(f"[audio] Native={_native_sr}Hz, resample {_native_sr}→{SAMPLERATE} ({_resample_up}/{_resample_down})")
+
 
 def check_mic_present():
     try:
@@ -198,6 +153,7 @@ def check_mic_present():
         pass
     return False
 
+
 def check_server():
     try:
         r = requests.get(f"{SERVER_URL}/ping", timeout=5)
@@ -205,105 +161,216 @@ def check_server():
     except Exception:
         return False
 
+
 def load_config():
     if os.path.exists(CONFIG_PATH):
-        with open(CONFIG_PATH, "r") as f:
+        with open(CONFIG_PATH) as f:
             return json.load(f)
     return {}
 
-def get_room_number(config):
-    return str(config.get("room_number", "101")).strip()
-
-def get_patient_name(config):
-    name = config.get("patient_name", "Patient").strip()
-    return "".join(word.capitalize() for word in name.split())
+def get_room_number(cfg): return str(cfg.get("room_number", "101")).strip()
+def get_patient_name(cfg):
+    return "".join(w.capitalize() for w in cfg.get("patient_name", "Patient").strip().split())
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  TTS  +  PIPER WARMUP
+#  STREAMING TTS ENGINE
+#
+#  How it works:
+#  - One persistent Piper process + one aplay process per utterance
+#  - speak_plain(text): sends full text at once (for greetings / fixed phrases)
+#  - speak_stream(sse_response): consumes SSE token stream from server,
+#    buffers tokens into word-chunks, writes each chunk to Piper stdin
+#    as it arrives — Piper synthesises and aplay plays in real time.
+#
+#  Result: The patient hears the first words of the AI question ~300ms
+#  after Phi3 starts generating, not after it finishes.
 # ═══════════════════════════════════════════════════════════════════
 
-def warmup_piper():
-    """
-    Run Piper once with a silent/empty string so it loads its model
-    files into OS page cache before the first real speak() call.
-    This cuts the first-speech delay from ~3-4s down to ~0.3s.
-    Output is piped to /dev/null so nothing plays.
-    """
-    print("[tts] Warming up Piper...")
-    try:
-        piper = subprocess.Popen(
-            ["piper", "--model", PIPER_MODEL, "--output_raw"],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
-        )
-        # Send a short silent phrase — just enough to force model load
-        piper.stdin.write(b" ")
-        piper.stdin.close()
-        # Drain stdout (raw audio) to /dev/null
-        subprocess.run(["cat"], stdin=piper.stdout, stdout=subprocess.DEVNULL)
-        piper.wait()
-        print("[tts] Piper warm.")
-    except Exception as e:
-        print(f"[tts] Warmup failed (non-fatal): {e}")
+def _open_piper_pipeline():
+    """Spawn Piper→aplay pipeline. Returns (piper_proc, aplay_proc)."""
+    piper = subprocess.Popen(
+        ["piper", "--model", PIPER_MODEL, "--output_raw"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL
+    )
+    aplay = subprocess.Popen(
+        ["aplay", "-D", _alsa_device, "-r", "22050", "-f", "S16_LE", "-c", "1"],
+        stdin=piper.stdout,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
+    )
+    return piper, aplay
 
 
-def speak(text, alsa_device, pa_device_index=None):
-    print(f"[tts] Speaking: '{text}'")
+def _close_pipeline(piper, aplay):
+    """Cleanly close Piper stdin, wait for aplay to finish draining."""
     try:
-        piper = subprocess.Popen(
-            ["piper", "--model", PIPER_MODEL, "--output_raw"],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-        )
-        aplay = subprocess.Popen(
-            ["aplay", "-D", alsa_device, "-r", "22050", "-f", "S16_LE", "-c", "1"],
-            stdin=piper.stdout, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
-        )
-        if BARGE_IN_ENABLED and pa_device_index is not None:
-            threading.Thread(
-                target=monitor_barge_in, args=(aplay, piper, pa_device_index), daemon=True
-            ).start()
-        piper.stdin.write(text.encode("utf-8"))
         piper.stdin.close()
-        aplay.wait()
-        piper.wait()
-        time.sleep(0.6)
+    except Exception:
+        pass
+    try:
+        aplay.wait(timeout=10)
+    except Exception:
+        pass
+    try:
+        piper.wait(timeout=3)
+    except Exception:
+        pass
+
+
+def speak_plain(text):
+    """
+    Blocking TTS for fixed phrases (greetings, closings).
+    Sends full text to Piper, waits for playback to finish.
+    """
+    if not text.strip():
+        return
+    print(f"[tts] '{text}'")
+    piper, aplay = _open_piper_pipeline()
+    try:
+        piper.stdin.write((text.strip() + "\n").encode("utf-8"))
+    except BrokenPipeError:
+        pass
+    _close_pipeline(piper, aplay)
+
+
+def speak_stream(sse_response):
+    """
+    Streaming TTS — consumes SSE token stream from /turn_stream.
+
+    Buffers incoming tokens. Flushes to Piper when:
+      - We have >= STREAM_CHUNK_WORDS words AND we just saw a space
+      - OR we hit a sentence-ending punctuation (. ? !)
+
+    This means Piper starts synthesising audio ~300ms after Phi3 begins
+    generating, not after it finishes — hiding most of the generation latency.
+
+    Returns (transcribed_text, status, full_question) from the done event.
+    """
+    text     = ""
+    status   = "STABLE"
+    question = "DONE"
+
+    piper, aplay = _open_piper_pipeline()
+    buf   = ""      # token accumulation buffer
+    spoke = False   # did we write anything to Piper?
+
+    def _flush(chunk):
+        nonlocal spoke
+        chunk = chunk.strip()
+        if not chunk:
+            return
+        print(f"[tts-stream] chunk: '{chunk}'")
+        try:
+            piper.stdin.write((chunk + "\n").encode("utf-8"))
+            piper.stdin.flush()
+            spoke = True
+        except BrokenPipeError:
+            pass
+
+    try:
+        for raw_line in sse_response.iter_lines():
+            if not raw_line:
+                continue
+            line = raw_line.decode("utf-8") if isinstance(raw_line, bytes) else raw_line
+            if not line.startswith("data: "):
+                continue
+
+            try:
+                evt = json.loads(line[6:])
+            except Exception:
+                continue
+
+            if evt.get("done"):
+                # Final event — flush remaining buffer, grab metadata
+                # Guard: never speak the literal word "DONE" to the patient
+                if buf.strip() and buf.strip().upper() != "DONE":
+                    _flush(buf)
+                    buf = ""
+                text     = evt.get("text", "")
+                status   = evt.get("status", "STABLE")
+                question = evt.get("question", "DONE")
+                break
+
+            token = evt.get("t", "")
+            if not token:
+                continue
+
+            buf += token
+
+            # Flush conditions:
+            # 1) Sentence boundary — flush immediately for natural prosody
+            if buf.rstrip()[-1:] in ".?!":
+                _flush(buf)
+                buf = ""
+                continue
+
+            # 2) Word boundary with enough words buffered
+            if token.endswith(" ") and len(buf.split()) >= STREAM_CHUNK_WORDS:
+                _flush(buf)
+                buf = ""
+
     except Exception as e:
-        print(f"[tts] Error: {e}")
+        print(f"[tts-stream] Stream error: {e}")
+        if buf.strip():
+            _flush(buf)
+
+    # Close pipeline — wait for aplay to finish playing
+    _close_pipeline(piper, aplay)
+
+    if not spoke and question and question.upper() != "DONE":
+        # Nothing was streamed (e.g. slow path sent pre-built tokens)
+        # Fall through — the tokens were still sent and flushed above
+        pass
+
+    return text, status, question
 
 
 # ═══════════════════════════════════════════════════════════════════
 #  RECORD
+#  Optimised VAD loop:
+#  - resample_poly (integer ratio, ~5x faster than FFT resample)
+#  - RMS gate (skip VAD model call on silent frames — most frames)
+#  - All device params cached at startup
 # ═══════════════════════════════════════════════════════════════════
 
-def record(pa_device_index, silence_duration=VAD_SILENCE_DURATION, max_duration=VAD_MAX_DURATION):
-    try:
-        native_sr = int(sd.query_devices(pa_device_index, "input")["default_samplerate"])
-    except Exception:
-        native_sr = 48000
-
-    VADIterator(vad_model, threshold=VAD_THRESHOLD, sampling_rate=SAMPLERATE,
-                min_silence_duration_ms=int(silence_duration * 1000), speech_pad_ms=100)
-
-    hw_blocksize        = int(VAD_FRAME_SAMPLES * (native_sr / SAMPLERATE))
-    silence_frames_need = int(silence_duration * native_sr / hw_blocksize)
-    max_frames          = int(max_duration * native_sr / hw_blocksize)
+def record(silence_duration=VAD_SILENCE_DURATION, max_duration=VAD_MAX_DURATION):
+    hw_blocksize        = int(VAD_FRAME_SAMPLES * (_native_sr / SAMPLERATE))
+    silence_frames_need = int(silence_duration * _native_sr / hw_blocksize)
+    max_frames          = int(max_duration * _native_sr / hw_blocksize)
 
     frames           = []
     silent_frames    = 0
     started_speaking = False
 
-    print(f"[mic] Listening at {native_sr}Hz...")
+    print("[mic] Listening...")
 
     try:
-        with sd.InputStream(samplerate=native_sr, channels=1, dtype="int16",
-                            device=pa_device_index, blocksize=hw_blocksize) as stream:
+        with sd.InputStream(samplerate=_native_sr, channels=1, dtype="int16",
+                            device=_pa_device_index, blocksize=hw_blocksize) as stream:
             for _ in range(max_frames):
-                frame           = np.ascontiguousarray(stream.read(hw_blocksize)[0], dtype=np.int16)
+                raw, _  = stream.read(hw_blocksize)
+                frame   = raw.flatten()
                 frames.append(frame.copy())
-                f32             = frame.flatten().astype(np.float32) / 32768.0
-                resampled       = signal.resample(f32, int(len(f32) * SAMPLERATE / native_sr))
-                confidence      = vad_model(torch.from_numpy(resampled).float(), SAMPLERATE).item()
-                if confidence > VAD_THRESHOLD:
+
+                # RMS gate — cheap numpy op, skips VAD on silence
+                rms = np.sqrt(np.mean(frame.astype(np.float32) ** 2))
+                if rms < RMS_GATE:
+                    if started_speaking:
+                        silent_frames += 1
+                        if silent_frames >= silence_frames_need:
+                            print("[mic] Silence — done.")
+                            break
+                    continue
+
+                # resample_poly — fast integer ratio downsampling
+                f32       = frame.astype(np.float32) / 32768.0
+                resampled = signal.resample_poly(f32, _resample_up, _resample_down)
+                conf      = vad_model(torch.from_numpy(resampled).float(), SAMPLERATE).item()
+
+                if conf > VAD_THRESHOLD:
                     started_speaking = True
                     silent_frames    = 0
                 elif started_speaking:
@@ -311,20 +378,22 @@ def record(pa_device_index, silence_duration=VAD_SILENCE_DURATION, max_duration=
                     if silent_frames >= silence_frames_need:
                         print("[mic] End of speech detected.")
                         break
+
     except Exception as e:
-        print(f"[mic] Capture error: {e}")
+        print(f"[mic] Error: {e}")
         return b""
 
     if not frames:
         return b""
 
-    audio_raw  = np.concatenate(frames, axis=0).flatten()
-    audio_16k  = signal.resample(audio_raw, int(len(audio_raw) * SAMPLERATE / native_sr)).astype(np.int16)
+    audio_raw = np.concatenate(frames, axis=0)
+    audio_16k = signal.resample_poly(
+        audio_raw.astype(np.float32), _resample_up, _resample_down
+    ).astype(np.int16)
 
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
         wav.write(f.name, SAMPLERATE, audio_16k)
         path = f.name
-
     with open(path, "rb") as f:
         data = f.read()
     os.remove(path)
@@ -335,29 +404,29 @@ def record(pa_device_index, silence_duration=VAD_SILENCE_DURATION, max_duration=
 #  SERVER CALLS
 # ═══════════════════════════════════════════════════════════════════
 
-def transcribe(audio_bytes):
+def turn_stream(audio_bytes, history):
+    """
+    POST audio + history → streaming SSE response.
+    Caller passes the response object to speak_stream() which
+    consumes tokens and drives Piper in real time.
+    Returns the raw streaming Response object (do NOT call .json()).
+    """
     try:
-        r   = requests.post(f"{SERVER_URL}/transcribe", data=audio_bytes,
-                            headers={"Content-Type": "application/octet-stream"}, timeout=30)
-        res = r.json()
-        print(f"[stt] '{res['text']}'")
-        return res["text"], res["status"]
-    except (Timeout, ConnectionError) as e:
-        print(f"[stt] Network error: {e}")
-        return "", "STABLE"
+        payload = {
+            "audio_b64": base64.b64encode(audio_bytes).decode(),
+            "history":   history
+        }
+        r = requests.post(
+            f"{SERVER_URL}/turn_stream",
+            json=payload,
+            stream=True,       # critical — don't buffer the response
+            timeout=60
+        )
+        return r
     except Exception as e:
-        print(f"[stt] Error: {e}")
-        return "", "STABLE"
+        print(f"[turn_stream] Connection error: {e}")
+        return None
 
-def get_next_question(history):
-    try:
-        r      = requests.post(f"{SERVER_URL}/next_question", json={"history": history}, timeout=60)
-        result = r.json()["question"].strip()
-        print(f"[next_question] '{result}'")
-        return result
-    except Exception as e:
-        print(f"[next_question] Error: {e}")
-        return "DONE"
 
 def check_urgent(history):
     try:
@@ -380,6 +449,7 @@ def init_lcd():
     except Exception:
         return None
 
+
 def show_error_on_lcd(lcd, line2, line3):
     if not lcd: return
     lcd.clear()
@@ -387,41 +457,39 @@ def show_error_on_lcd(lcd, line2, line3):
     lcd.cursor_pos = (2, 0); lcd.write_string(line2.center(20)[:20])
     lcd.cursor_pos = (3, 0); lcd.write_string(line3.center(20)[:20])
 
-def show_status_on_lcd(lcd, status, flagged_urgent):
+
+def show_status_on_lcd(lcd, status, flagged):
     if not lcd: return
     lcd.clear()
     lcd.cursor_pos = (0, 0); lcd.write_string("== TRIAGE STATUS ==")
     lcd.cursor_pos = (2, 0)
-    if status == "URGENT":       lcd.write_string(">>  !! URGENT !!  <<")
-    elif status == "MONITOR":    lcd.write_string(">>    MONITOR     <<")
-    else:                        lcd.write_string(">>    STABLE      <<")
+    if status == "URGENT":    lcd.write_string(">>  !! URGENT !!  <<")
+    elif status == "MONITOR": lcd.write_string(">>    MONITOR     <<")
+    else:                     lcd.write_string(">>    STABLE      <<")
     lcd.cursor_pos = (3, 0)
-    lcd.write_string("!! NURSE ALERTED !!" if flagged_urgent else "Assessment complete")
+    lcd.write_string("!! NURSE ALERTED !!" if flagged else "Assessment complete")
 
 
 # ═══════════════════════════════════════════════════════════════════
 #  LOGGING
 # ═══════════════════════════════════════════════════════════════════
 
-def save_log(session_dir, session_record):
+def save_log(session_dir, record_data):
     os.makedirs(session_dir, exist_ok=True)
     with open(os.path.join(session_dir, "log.json"), "w") as f:
-        json.dump(session_record, f, indent=2)
-
+        json.dump(record_data, f, indent=2)
     all_records = []
     if os.path.exists(PATIENT_INFO_PATH):
         try:
-            with open(PATIENT_INFO_PATH, "r") as f:
-                content = f.read().strip()
-                if content:
-                    all_records = json.loads(content)
+            content = open(PATIENT_INFO_PATH).read().strip()
+            if content:
+                all_records = json.loads(content)
         except Exception:
             pass
-
-    all_records.append(session_record)
+    all_records.append(record_data)
     with open(PATIENT_INFO_PATH, "w") as f:
         json.dump(all_records, f, indent=2)
-    print(f"[log] Total records: {len(all_records)}")
+    print(f"[log] {len(all_records)} total records.")
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -429,44 +497,46 @@ def save_log(session_dir, session_record):
 # ═══════════════════════════════════════════════════════════════════
 
 def main():
+    # ── Hardware discovery ─────────────────────────────────────────
     alsa_device = find_alsa_device()
     if alsa_device is None:
         print("[main] FATAL: No ALSA output found.")
         return
+    # Set immediately so speak_plain works in error paths below
+    global _alsa_device
+    _alsa_device = alsa_device
 
     lcd = init_lcd()
     if lcd: lcd.write_string("PULSE BOOTING...")
 
-    if not check_mic_present() or (pa_input_index := find_portaudio_input_device()) is None:
+    if not check_mic_present():
         show_error_on_lcd(lcd, "MIC NOT FOUND", "Check Hardware")
-        speak("I cannot hear you. My microphone is disconnected.", alsa_device)
+        speak_plain("I cannot hear you. My microphone is disconnected.")
         return
 
-    if not run_microphone_calibration(pa_input_index):
-        show_error_on_lcd(lcd, "MIC MUTED / ERROR", "Run Mixer Checks")
-        speak("My microphone is failing diagnostic checks.", alsa_device)
+    pa_input_index = find_portaudio_input_device()
+    if pa_input_index is None:
+        show_error_on_lcd(lcd, "MIC NOT FOUND", "Check Hardware")
+        speak_plain("I cannot find the microphone input.")
         return
+
+    # Cache audio device info once
+    init_audio_cache(alsa_device, pa_input_index)
 
     if not check_server():
         show_error_on_lcd(lcd, "SERVER OFFLINE", "Check Laptop Host")
-        speak("I cannot connect to my brain server.", alsa_device)
+        speak_plain("I cannot connect to my brain server.")
         return
 
-    # ── Warm up Piper while checks are still running ───────────────
-    # This runs synchronously here but you could thread it above if
-    # you want it overlapping with check_server().
-    warmup_piper()
-
-    config       = load_config()
-    room         = get_room_number(config)
-    patient_name = get_patient_name(config)
+    cfg          = load_config()
+    room         = get_room_number(cfg)
+    patient_name = get_patient_name(cfg)
     date         = datetime.now().strftime("%m/%d/%Y")
     time_str     = datetime.now().strftime("%I:%M%p")
-    session_dir  = os.path.join(LOG_DIR, f"{date.replace('/', '-')}_{time_str}_Room{room}_{patient_name}")
+    session_dir  = os.path.join(LOG_DIR, f"{date.replace('/','-')}_{time_str}_Room{room}_{patient_name}")
 
     if lcd:
-        lcd.clear()
-        lcd.write_string("PULSE READY")
+        lcd.clear(); lcd.write_string("PULSE READY")
 
     set_status_led("STABLE")
 
@@ -474,31 +544,49 @@ def main():
     history  = []
     status   = "STABLE"
 
-    # First question
+    # ── First question (fixed text — plain TTS, no streaming needed) ─
     first_q = f"Hello {patient_name}! I am Pulse. What's bothering you today?"
-    speak(first_q, alsa_device, pa_input_index)
-    audio                 = record(pa_device_index=pa_input_index)
-    answer, answer_status = transcribe(audio)
+    speak_plain(first_q)
+
+    # Record patient's first answer
+    audio = record()
+
+    # Send to server — streaming response drives Piper for next question
+    sse = turn_stream(audio, [])
+    if sse is None:
+        print("[main] Server unreachable on first turn.")
+        return
+
+    # speak_stream consumes the SSE, speaks the next question aloud,
+    # and returns the metadata from the done event
+    answer, answer_status, next_q = speak_stream(sse)
     history.append({"q": first_q, "a": answer, "status": answer_status})
     if priority[answer_status] > priority[status]:
         status = answer_status
     set_status_led(status)
     print(f"[status] {status}")
 
-    # Follow-up loop
+    # ── Follow-up loop ─────────────────────────────────────────────
     for i in range(MAX_QUESTIONS - 1):
-        print(f"\n--- Question {i + 2} of {MAX_QUESTIONS} ---")
-
-        next_q = get_next_question(history)
-
-        if next_q.strip().upper() == "DONE":
+        if not next_q or next_q.strip().upper() == "DONE":
             print("[main] AI signalled DONE.")
             break
 
-        speak(next_q, alsa_device, pa_input_index)
-        audio                 = record(pa_device_index=pa_input_index)
-        answer, answer_status = transcribe(audio)
-        history.append({"q": next_q, "a": answer, "status": answer_status})
+        print(f"\n--- Q{i+2} of {MAX_QUESTIONS}: '{next_q}' ---")
+
+        # Record answer to the question that was ALREADY spoken via streaming
+        audio = record()
+
+        # Send audio + current history → streaming response speaks next question
+        sse = turn_stream(audio, history)
+        if sse is None:
+            print("[main] Server unreachable — ending session.")
+            break
+
+        prev_q = next_q
+        answer, answer_status, next_q = speak_stream(sse)
+
+        history.append({"q": prev_q, "a": answer, "status": answer_status})
         if priority[answer_status] > priority[status]:
             status = answer_status
         set_status_led(status)
@@ -506,26 +594,26 @@ def main():
 
         urgent_streak = sum(1 for qa in history[-2:] if qa.get("status") == "URGENT")
         if urgent_streak >= 2:
-            print("[main] Two consecutive URGENT answers — ending questions early.")
+            print("[main] Two consecutive URGENT — ending early.")
             break
 
     # ── Final decision ─────────────────────────────────────────────
     print("\n--- Finalizing ---")
-    flagged_urgent = check_urgent(history)
+    flagged = check_urgent(history)
 
-    if flagged_urgent:
+    if flagged:
         status = "URGENT"
         set_status_led("URGENT")
-        speak(f"Based on your responses {patient_name}, I am alerting a nurse immediately.", alsa_device, pa_input_index)
+        speak_plain(f"Based on your responses {patient_name}, I am alerting a nurse immediately.")
     else:
-        speak(f"Thank you {patient_name}. Your assessment is complete.", alsa_device, pa_input_index)
+        speak_plain(f"Thank you {patient_name}. Your assessment is complete.")
 
-    speak("Feel better soon.", alsa_device, pa_input_index)
+    speak_plain("Feel better soon.")
 
-    show_status_on_lcd(lcd, status, flagged_urgent)
+    show_status_on_lcd(lcd, status, flagged)
     save_log(session_dir, {
         "header":     {"patient_name": patient_name, "room": room, "date": date, "time": time_str},
-        "triage":     {"final_status": status, "flagged_urgent": flagged_urgent},
+        "triage":     {"final_status": status, "flagged_urgent": flagged},
         "assessment": history
     })
 

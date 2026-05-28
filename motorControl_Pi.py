@@ -4,75 +4,67 @@ import ydlidar
 from lidarHelpers import init_lidar, get_front_distance
 
 ARDUINO_PORT = "/dev/arduino"
-
 arduino = None  # lazy — not connected until connect() is called
 
+
 def connect():
-    """Call this explicitly during boot, not on import."""
     global arduino
     ser = serial.Serial(ARDUINO_PORT, 9600, timeout=1)
-    # Read until READY instead of sleeping a fixed 2 seconds
     deadline = time.time() + 5.0
     while time.time() < deadline:
         line = ser.readline().decode(errors="ignore").strip()
         if line == "READY":
-            print(f"[arduino] Connected — got READY")
+            print("[arduino] Connected — READY")
             break
         if line:
             print(f"[arduino] boot: {line}")
     arduino = ser
     return ser
 
-def wait_for(response, timeout=10):
+
+def wait_for(response, timeout=5):
     start = time.time()
     while time.time() - start < timeout:
         line = arduino.readline().decode().strip()
-        if line:
-            print(f"Arduino: {line}")
-        if line == response:
-            return True
+        if line: print(f"Arduino: {line}")
+        if line == response: return True
     return False
 
+
 def move(direction, speed, seconds):
-    cmd = f"MOVE {direction} {speed} {seconds}\n"
-    arduino.write(cmd.encode('utf-8'))
-    print(f"Sent: {cmd.strip()}")
-    wait_for("DONE", timeout=seconds + 10)
+    arduino.write(f"MOVE {direction} {speed} {seconds}\n".encode())
+    wait_for("DONE", timeout=seconds + 5)
+
 
 def turn(side, seconds):
-    cmd = f"TURN {side} {seconds}\n"
-    arduino.write(cmd.encode('utf-8'))
-    print(f"Sent: {cmd.strip()}")
-    wait_for("DONE", timeout=seconds + 10)
+    arduino.write(f"TURN {side} {seconds}\n".encode())
+    wait_for("DONE", timeout=seconds + 5)
+
 
 def stop():
     arduino.write(b"STOP\n")
-    print("Sent: STOP")
-    wait_for("STOPPED", timeout=3)
+    wait_for("STOPPED", timeout=2)
+
 
 def go():
     arduino.write(b"GO\n")
-    print("Sent: GO")
-    wait_for("UNLOCKED", timeout=3)
+    wait_for("UNLOCKED", timeout=2)
+
 
 def moveUntilThreshold(direction, threshold_cm, laser, speed=200):
-    cmd = f"MOVE {direction} {speed} 9999\n"
-    arduino.write(cmd.encode('utf-8'))
-    print(f"Sent: {cmd.strip()}")
-    wait_for("MOVING", timeout=3)
-
+    arduino.write(f"MOVE {direction} {speed} 9999\n".encode())
+    wait_for("MOVING", timeout=1)
     scan = ydlidar.LaserScan()
     while True:
         if laser.doProcessSimple(scan):
             dist = get_front_distance(scan)
             if dist is not None:
-                print(f"Forward distance: {dist:.1f}cm")
+                print(f"[move] {dist:.1f}cm", end='\r')
                 if dist <= threshold_cm:
-                    stop()
-                    go()
-                    print(f"Obstacle at {dist:.1f}cm — stopped.")
+                    stop(); go()
+                    print(f"\n[move] Stopped at {dist:.1f}cm")
                     return dist, scan
-        time.sleep(0.05)
+
 
 if __name__ == "__main__":
     connect()
@@ -80,9 +72,8 @@ if __name__ == "__main__":
     try:
         moveUntilThreshold('F', 15, laser)
     except KeyboardInterrupt:
-        print("\nInterrupted by user")
+        print("\nInterrupted")
     finally:
         stop()
-        laser.turnOff()
-        laser.disconnecting()
+        laser.turnOff(); laser.disconnecting()
         arduino.close()
