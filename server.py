@@ -22,7 +22,7 @@ SERVER_PORT = 5001
 
 OLLAMA_OPTS_FAST = {
     "temperature":    0.1,
-    "num_predict":    25,    # hard cap — a 12-word question ≈ 15 tokens; 25 kills rambling
+    "num_predict":    20,    # 20 tokens ≈ 10-12 words — just enough for one question
     "num_ctx":        512,
     "repeat_penalty": 1.3,
     "top_k":          20,
@@ -137,6 +137,13 @@ FILLER_PREFIXES = [
     "Of course.", "Certainly.", "Understood.", "Noted.",
 ]
 
+# Phrases that mean the model is done but phrased it wrong
+DONE_SIGNALS = [
+    "done", "no further", "no more", "enough information",
+    "no other information", "sufficient information", "that's all",
+    "reply done", "i have enough", "no additional"
+]
+
 
 def clean_question(q):
     if not q:
@@ -148,16 +155,21 @@ def clean_question(q):
         if q.lower().startswith(filler.lower()):
             q = q[len(filler):].strip()
 
-    # Hard cut at first question mark — kills all trailing instructions/rambling
+    # If the model echoed a DONE signal instead of a question, catch it
+    q_lower = q.lower()
+    for signal in DONE_SIGNALS:
+        if signal in q_lower:
+            return "DONE"
+
+    # Hard cut at first question mark — kills trailing instructions
     if "?" in q:
         q = q[:q.index("?") + 1].strip()
+    else:
+        # No question mark at all — model didn't follow format, discard
+        return "DONE"
 
-    # Sanity guards
-    if not q:
-        return "DONE"
-    if q.upper() == "DONE":
-        return "DONE"
-    if len(q) > 120:
+    # Final sanity guards
+    if not q or len(q) > 100:
         return "DONE"
 
     return q
@@ -221,55 +233,65 @@ def phi3_stream(prompt, opts):
 # ═══════════════════════════════════════════════════════════════════
 # QUESTION PROMPTS
 #
-#   build_question_prompt()  — fast path: status already known via
-#     keyword match, just need the next question streamed in real time.
+# Key design decisions:
 #
-#   build_assess_prompt()    — AI path: no keyword matched, so we
-#     first classify status (non-streaming, OLLAMA_OPTS_URGENT), then
-#     stream the question separately via build_question_prompt().
+# 1. The topic list is ordered by priority. Phi3 is told to pick the
+#    FIRST uncovered topic — this forces a logical progression and
+#    prevents it from asking two similar pain questions in a row.
 #
-# Both prompts are warm and clinical — the robot should feel caring,
-# not cold, while being strict enough to stop Phi3 from rambling.
+# 2. "Output ONLY the question" is the last line before the answer
+#    anchor ("Next question:") so it's the freshest instruction in
+#    context when Phi3 starts generating.
+#
+# 3. No mention of "DONE" in the question prompt at all — the only
+#    way "DONE" appears is if the model outputs it literally with no
+#    question mark, which clean_question catches. Mentioning DONE in
+#    the prompt was causing the model to echo the instruction.
 # ═══════════════════════════════════════════════════════════════════
 
+# Ordered topic progression — Phi3 picks the first one not yet covered.
+# Ordering matters: pain score before location prevents double-asking.
+TOPIC_PROGRESSION = [
+    "1. Pain score 1-10 (if not given)",
+    "2. Where exactly is the pain or discomfort",
+    "3. How long has this been going on",
+    "4. Any difficulty breathing",
+    "5. Any relevant medications or allergies",
+    "6. Any relevant medical history",
+]
+
+
 def build_question_prompt(history_text):
+    topics = "\n".join(TOPIC_PROGRESSION)
     return (
-        "You are a caring nurse robot doing a patient triage check-in.\n"
-        "Based on the conversation so far, ask the single most important\n"
-        "follow-up question to understand the patient's condition better.\n\n"
-        "STRICT RULES — follow all of them:\n"
-        "- ONE question only\n"
-        "- Under 12 words\n"
-        "- Must end with a question mark\n"
-        "- No preamble, no explanation, no instructions after the question\n"
-        "- Output ONLY the question text, nothing else\n"
-        "- If you have enough information already, output only: DONE\n\n"
-        "Topics to cover (pick the most relevant one not yet asked):\n"
-        "pain location, pain level 1-10, duration, breathing difficulty,\n"
-        "current medications, recent medical history, allergies.\n\n"
-        f"Conversation so far:\n{history_text}\n\n"
+        "You are a caring nurse robot doing a triage check-in.\n"
+        "Ask the next uncovered question from this ordered list:\n\n"
+        f"{topics}\n\n"
+        "Skip topics already answered. If all covered, output: DONE\n\n"
+        "Rules: one question, under 10 words, ends with ?, output ONLY the question.\n\n"
+        f"Conversation:\n{history_text}\n\n"
         "Next question:"
     )
 
 
 def build_assess_prompt(history_text, last_answer):
+    topics = "\n".join(TOPIC_PROGRESSION)
     return (
-        "You are a caring clinical triage assistant for a nurse robot.\n"
-        "Your job is to assess the patient's wellbeing accurately and compassionately.\n\n"
+        "You are a caring clinical triage assistant for a nurse robot.\n\n"
         f"Conversation so far:\n{history_text}\n\n"
         f"Patient's latest answer: \"{last_answer}\"\n\n"
-        "Step 1 — Classify the latest answer:\n"
+        "Classify the latest answer:\n"
         "  URGENT  = life-threatening: severe chest pain, cannot breathe, unconscious,\n"
         "            uncontrolled bleeding, seizure, stroke, pain 9-10/10.\n"
         "  MONITOR = moderate concern: pain 4-8/10, fever, dizziness, nausea,\n"
-        "            shortness of breath, confusion, or multiple mild symptoms.\n"
+        "            shortness of breath, confusion.\n"
         "  STABLE  = mild or no symptoms: pain 1-3/10, feeling generally okay.\n"
         "  When in doubt, choose the less severe option.\n\n"
-        "Step 2 — Ask the single most important follow-up question not yet asked.\n"
-        "  - Under 12 words, ends with ?\n"
-        "  - Topics: main complaint, pain level, duration, breathing, medications.\n"
-        "  - If you have enough info already, write DONE instead.\n\n"
-        "Reply with ONLY valid JSON, no markdown, no extra text:\n"
+        "Then pick the next uncovered question from this list:\n\n"
+        f"{topics}\n\n"
+        "Rules: one question, under 10 words, ends with ?.\n"
+        "If all topics covered, use DONE.\n\n"
+        "Reply with ONLY valid JSON, no markdown:\n"
         "{\"status\": \"URGENT|MONITOR|STABLE\", \"question\": \"your question or DONE\"}"
     )
 
@@ -407,7 +429,7 @@ def turn_stream():
                 if status not in ["URGENT", "MONITOR", "STABLE"]:
                     status = "STABLE"
 
-                print(f"[turn_stream] classified as {status} — now streaming question...")
+                print(f"[turn_stream] classified as {status} — streaming question...")
                 question_tokens = []
                 for token in phi3_stream(build_question_prompt(history_text + f"\nPatient: {text}"), OLLAMA_OPTS_FAST):
                     question_tokens.append(token)
