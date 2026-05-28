@@ -14,7 +14,6 @@ import threading
 from datetime import datetime
 import numpy as np
 import torch
-from silero_vad import load_silero_vad
 
 # ═══════════════════════════════════════════════════════════════════
 #  PI PERFORMANCE TUNING
@@ -35,11 +34,8 @@ VAD_THRESHOLD        = 0.70
 VAD_SILENCE_DURATION = 1.5
 VAD_MAX_DURATION     = 15
 VAD_FRAME_SAMPLES    = 512
-RMS_GATE             = 150       # skip VAD call on obviously silent frames
+RMS_GATE             = 150
 
-# Streaming TTS chunking — flush to Piper once we have this many words
-# buffered AND we're at a word boundary. Lower = faster first word.
-# Higher = better prosody. 4 is the sweet spot.
 STREAM_CHUNK_WORDS   = 4
 
 LED_RED_PIN   = 17
@@ -53,11 +49,23 @@ CONFIG_PATH       = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mo
 os.makedirs(LOG_DIR, exist_ok=True)
 
 # ═══════════════════════════════════════════════════════════════════
-#  VAD
+#  VAD — loaded in a background thread so it doesn't block the
+#  greeting.  speak_plain() runs immediately; record() waits for VAD
+#  to be ready only if it hasn't finished yet by the time the patient
+#  finishes speaking (which it always has — loading takes ~2s).
 # ═══════════════════════════════════════════════════════════════════
-print("[vad] Loading Silero VAD...")
-vad_model = load_silero_vad()
-print("[vad] Ready.")
+vad_model      = None
+_vad_ready     = threading.Event()
+
+def _load_vad_bg():
+    global vad_model
+    print("[vad] Loading Silero VAD in background...")
+    from silero_vad import load_silero_vad
+    vad_model = load_silero_vad()
+    _vad_ready.set()
+    print("[vad] Ready.")
+
+threading.Thread(target=_load_vad_bg, daemon=True).start()
 
 # ═══════════════════════════════════════════════════════════════════
 #  GPIO
@@ -98,8 +106,7 @@ def set_status_led(status_type):
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  AUDIO DEVICE CACHE
-#  Queried once at startup — never again during the session.
+#  AUDIO DEVICE CACHE — queried once at startup
 # ═══════════════════════════════════════════════════════════════════
 _native_sr       = None
 _pa_device_index = None
@@ -174,21 +181,10 @@ def get_patient_name(cfg):
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  STREAMING TTS ENGINE
-#
-#  How it works:
-#  - One persistent Piper process + one aplay process per utterance
-#  - speak_plain(text): sends full text at once (for greetings / fixed phrases)
-#  - speak_stream(sse_response): consumes SSE token stream from server,
-#    buffers tokens into word-chunks, writes each chunk to Piper stdin
-#    as it arrives — Piper synthesises and aplay plays in real time.
-#
-#  Result: The patient hears the first words of the AI question ~300ms
-#  after Phi3 starts generating, not after it finishes.
+#  TTS ENGINE
 # ═══════════════════════════════════════════════════════════════════
 
 def _open_piper_pipeline():
-    """Spawn Piper→aplay pipeline. Returns (piper_proc, aplay_proc)."""
     piper = subprocess.Popen(
         ["piper", "--model", PIPER_MODEL, "--output_raw"],
         stdin=subprocess.PIPE,
@@ -205,7 +201,6 @@ def _open_piper_pipeline():
 
 
 def _close_pipeline(piper, aplay):
-    """Cleanly close Piper stdin, wait for aplay to finish draining."""
     try:
         piper.stdin.close()
     except Exception:
@@ -221,10 +216,7 @@ def _close_pipeline(piper, aplay):
 
 
 def speak_plain(text):
-    """
-    Blocking TTS for fixed phrases (greetings, closings).
-    Sends full text to Piper, waits for playback to finish.
-    """
+    """Blocking TTS for fixed phrases."""
     if not text.strip():
         return
     print(f"[tts] '{text}'")
@@ -238,24 +230,16 @@ def speak_plain(text):
 
 def speak_stream(sse_response):
     """
-    Streaming TTS — consumes SSE token stream from /turn_stream.
-
-    Buffers incoming tokens. Flushes to Piper when:
-      - We have >= STREAM_CHUNK_WORDS words AND we just saw a space
-      - OR we hit a sentence-ending punctuation (. ? !)
-
-    This means Piper starts synthesising audio ~300ms after Phi3 begins
-    generating, not after it finishes — hiding most of the generation latency.
-
-    Returns (transcribed_text, status, full_question) from the done event.
+    Consumes SSE token stream from /turn_stream, drives Piper in real time.
+    Returns (transcribed_text, status, full_question).
     """
     text     = ""
     status   = "STABLE"
     question = "DONE"
 
     piper, aplay = _open_piper_pipeline()
-    buf   = ""      # token accumulation buffer
-    spoke = False   # did we write anything to Piper?
+    buf   = ""
+    spoke = False
 
     def _flush(chunk):
         nonlocal spoke
@@ -277,20 +261,17 @@ def speak_stream(sse_response):
             line = raw_line.decode("utf-8") if isinstance(raw_line, bytes) else raw_line
             if not line.startswith("data: "):
                 continue
-
             try:
                 evt = json.loads(line[6:])
             except Exception:
                 continue
 
             if evt.get("done"):
-                # Final event — flush remaining buffer, grab metadata
-                # Guard: never speak the literal word "DONE" to the patient
                 if buf.strip() and buf.strip().upper() != "DONE":
                     _flush(buf)
                     buf = ""
-                text     = evt.get("text", "")
-                status   = evt.get("status", "STABLE")
+                text     = evt.get("text",     "")
+                status   = evt.get("status",   "STABLE")
                 question = evt.get("question", "DONE")
                 break
 
@@ -300,14 +281,13 @@ def speak_stream(sse_response):
 
             buf += token
 
-            # Flush conditions:
-            # 1) Sentence boundary — flush immediately for natural prosody
+            # Flush on sentence boundary
             if buf.rstrip()[-1:] in ".?!":
                 _flush(buf)
                 buf = ""
                 continue
 
-            # 2) Word boundary with enough words buffered
+            # Flush on word boundary once enough words buffered
             if token.endswith(" ") and len(buf.split()) >= STREAM_CHUNK_WORDS:
                 _flush(buf)
                 buf = ""
@@ -317,26 +297,22 @@ def speak_stream(sse_response):
         if buf.strip():
             _flush(buf)
 
-    # Close pipeline — wait for aplay to finish playing
     _close_pipeline(piper, aplay)
-
-    if not spoke and question and question.upper() != "DONE":
-        # Nothing was streamed (e.g. slow path sent pre-built tokens)
-        # Fall through — the tokens were still sent and flushed above
-        pass
-
     return text, status, question
 
 
 # ═══════════════════════════════════════════════════════════════════
 #  RECORD
-#  Optimised VAD loop:
-#  - resample_poly (integer ratio, ~5x faster than FFT resample)
-#  - RMS gate (skip VAD model call on silent frames — most frames)
-#  - All device params cached at startup
+#  Waits for VAD to finish loading (non-blocking during greeting).
 # ═══════════════════════════════════════════════════════════════════
 
 def record(silence_duration=VAD_SILENCE_DURATION, max_duration=VAD_MAX_DURATION):
+    # Block here only if VAD isn't ready yet — in practice the greeting
+    # speech takes longer than VAD load time so this wait is usually 0ms.
+    if not _vad_ready.is_set():
+        print("[mic] Waiting for VAD to finish loading...")
+        _vad_ready.wait()
+
     hw_blocksize        = int(VAD_FRAME_SAMPLES * (_native_sr / SAMPLERATE))
     silence_frames_need = int(silence_duration * _native_sr / hw_blocksize)
     max_frames          = int(max_duration * _native_sr / hw_blocksize)
@@ -355,7 +331,6 @@ def record(silence_duration=VAD_SILENCE_DURATION, max_duration=VAD_MAX_DURATION)
                 frame   = raw.flatten()
                 frames.append(frame.copy())
 
-                # RMS gate — cheap numpy op, skips VAD on silence
                 rms = np.sqrt(np.mean(frame.astype(np.float32) ** 2))
                 if rms < RMS_GATE:
                     if started_speaking:
@@ -365,7 +340,6 @@ def record(silence_duration=VAD_SILENCE_DURATION, max_duration=VAD_MAX_DURATION)
                             break
                     continue
 
-                # resample_poly — fast integer ratio downsampling
                 f32       = frame.astype(np.float32) / 32768.0
                 resampled = signal.resample_poly(f32, _resample_up, _resample_down)
                 conf      = vad_model(torch.from_numpy(resampled).float(), SAMPLERATE).item()
@@ -405,12 +379,6 @@ def record(silence_duration=VAD_SILENCE_DURATION, max_duration=VAD_MAX_DURATION)
 # ═══════════════════════════════════════════════════════════════════
 
 def turn_stream(audio_bytes, history):
-    """
-    POST audio + history → streaming SSE response.
-    Caller passes the response object to speak_stream() which
-    consumes tokens and drives Piper in real time.
-    Returns the raw streaming Response object (do NOT call .json()).
-    """
     try:
         payload = {
             "audio_b64": base64.b64encode(audio_bytes).decode(),
@@ -419,7 +387,7 @@ def turn_stream(audio_bytes, history):
         r = requests.post(
             f"{SERVER_URL}/turn_stream",
             json=payload,
-            stream=True,       # critical — don't buffer the response
+            stream=True,
             timeout=60
         )
         return r
@@ -497,12 +465,11 @@ def save_log(session_dir, record_data):
 # ═══════════════════════════════════════════════════════════════════
 
 def main():
-    # ── Hardware discovery ─────────────────────────────────────────
+    # ── Hardware discovery ──────────────────────────────────────────
     alsa_device = find_alsa_device()
     if alsa_device is None:
         print("[main] FATAL: No ALSA output found.")
         return
-    # Set immediately so speak_plain works in error paths below
     global _alsa_device
     _alsa_device = alsa_device
 
@@ -520,7 +487,6 @@ def main():
         speak_plain("I cannot find the microphone input.")
         return
 
-    # Cache audio device info once
     init_audio_cache(alsa_device, pa_input_index)
 
     if not check_server():
@@ -544,21 +510,20 @@ def main():
     history  = []
     status   = "STABLE"
 
-    # ── First question (fixed text — plain TTS, no streaming needed) ─
+    # ── First question ──────────────────────────────────────────────
+    # VAD is loading in the background right now. speak_plain takes a
+    # few seconds — by the time it finishes, VAD will be ready and
+    # record() will not block at all.
     first_q = f"Hello {patient_name}! I am Pulse. What's bothering you today?"
     speak_plain(first_q)
 
-    # Record patient's first answer
     audio = record()
 
-    # Send to server — streaming response drives Piper for next question
     sse = turn_stream(audio, [])
     if sse is None:
         print("[main] Server unreachable on first turn.")
         return
 
-    # speak_stream consumes the SSE, speaks the next question aloud,
-    # and returns the metadata from the done event
     answer, answer_status, next_q = speak_stream(sse)
     history.append({"q": first_q, "a": answer, "status": answer_status})
     if priority[answer_status] > priority[status]:
@@ -566,7 +531,7 @@ def main():
     set_status_led(status)
     print(f"[status] {status}")
 
-    # ── Follow-up loop ─────────────────────────────────────────────
+    # ── Follow-up loop ──────────────────────────────────────────────
     for i in range(MAX_QUESTIONS - 1):
         if not next_q or next_q.strip().upper() == "DONE":
             print("[main] AI signalled DONE.")
@@ -574,10 +539,8 @@ def main():
 
         print(f"\n--- Q{i+2} of {MAX_QUESTIONS}: '{next_q}' ---")
 
-        # Record answer to the question that was ALREADY spoken via streaming
         audio = record()
 
-        # Send audio + current history → streaming response speaks next question
         sse = turn_stream(audio, history)
         if sse is None:
             print("[main] Server unreachable — ending session.")
@@ -597,7 +560,7 @@ def main():
             print("[main] Two consecutive URGENT — ending early.")
             break
 
-    # ── Final decision ─────────────────────────────────────────────
+    # ── Final decision ──────────────────────────────────────────────
     print("\n--- Finalizing ---")
     flagged = check_urgent(history)
 
