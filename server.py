@@ -106,7 +106,7 @@ def keyword_status(text):
 
 def transcribe_bytes(wav_bytes):
     try:
-        buf      = io.BytesIO(wav_bytes)
+        buf          = io.BytesIO(wav_bytes)
         audio_np, sr = sf.read(buf, dtype="float32")
         if audio_np.ndim > 1:
             audio_np = audio_np.mean(axis=1)
@@ -157,7 +157,7 @@ def clean_question(q):
         return "DONE"
     if q.upper() == "DONE":
         return "DONE"
-    if len(q) > 120:   # model escaped the num_predict cap somehow
+    if len(q) > 120:
         return "DONE"
 
     return q
@@ -221,28 +221,18 @@ def phi3_stream(prompt, opts):
 # ═══════════════════════════════════════════════════════════════════
 # QUESTION PROMPTS
 #
-# Two separate prompt builders so the logic is clear and easy to tune.
+#   build_question_prompt()  — fast path: status already known via
+#     keyword match, just need the next question streamed in real time.
 #
-#   build_question_prompt()  — used on the fast (keyword) path where
-#     we already know the triage status and just need the next question.
+#   build_assess_prompt()    — AI path: no keyword matched, so we
+#     first classify status (non-streaming, OLLAMA_OPTS_URGENT), then
+#     stream the question separately via build_question_prompt().
 #
-#   build_assess_prompt()    — used on the AI path where we need BOTH
-#     a status classification AND a next question in one shot (non-
-#     streaming, returns JSON).  The question tokens are then streamed
-#     separately via build_question_prompt() so the patient hears them
-#     as soon as they arrive.
-#
-# The prompts are deliberately warm and clinical — the nurse robot
-# should feel caring, not robotic, while staying terse enough that
-# Phi3:mini won't hallucinate instructions into the output.
+# Both prompts are warm and clinical — the robot should feel caring,
+# not cold, while being strict enough to stop Phi3 from rambling.
 # ═══════════════════════════════════════════════════════════════════
 
 def build_question_prompt(history_text):
-    """
-    Returns a prompt for generating the single next triage question.
-    Warm but strict: one short question, ends with ?, nothing else.
-    This is the original intent — clinically accurate AND empathetic.
-    """
     return (
         "You are a caring nurse robot doing a patient triage check-in.\n"
         "Based on the conversation so far, ask the single most important\n"
@@ -263,12 +253,6 @@ def build_question_prompt(history_text):
 
 
 def build_assess_prompt(history_text, last_answer):
-    """
-    Returns a prompt that classifies the patient's latest answer AND
-    generates the next question in one shot (JSON output).
-    Used only on the AI path (non-streaming status classification).
-    Warm, accurate, and constrained.
-    """
     return (
         "You are a caring clinical triage assistant for a nurse robot.\n"
         "Your job is to assess the patient's wellbeing accurately and compassionately.\n\n"
@@ -315,7 +299,7 @@ def turn():
 
         try:
             wav_bytes = base64.b64decode(audio_b64)
-        except Exception as e:
+        except Exception:
             return jsonify({"text": "", "status": "STABLE", "question": "DONE", "error": "invalid base64"}), 400
 
         text = transcribe_bytes(wav_bytes)
@@ -380,10 +364,9 @@ def turn_stream():
 
         try:
             wav_bytes = base64.b64decode(audio_b64)
-        except Exception as e:
+        except Exception:
             return jsonify({"text": "", "status": "STABLE", "question": "DONE", "error": "invalid base64"}), 400
 
-        # Transcribe first — everything else depends on it
         text = transcribe_bytes(wav_bytes)
 
         if not text:
@@ -401,20 +384,16 @@ def turn_stream():
             # ── Fast path (keyword matched) ────────────────────────
             if fast_status is not None:
                 print(f"[turn_stream] fast path: {fast_status}")
-
                 question_tokens = []
                 for token in phi3_stream(build_question_prompt(history_text), OLLAMA_OPTS_FAST):
                     question_tokens.append(token)
                     yield f"data: {json.dumps({'t': token})}\n\n"
-
                 question = clean_question("".join(question_tokens).split("\n")[0].strip())
                 yield f"data: {json.dumps({'done': True, 'text': text, 'status': fast_status, 'question': question})}\n\n"
 
             # ── AI assessment path ─────────────────────────────────
             else:
                 print("[turn_stream] AI path — classifying status...")
-
-                # Status classification is fast (num_predict=3), non-streaming
                 status_prompt = (
                     "Triage nurse. Classify this patient response.\n\n"
                     f"Patient: '{text}'\n\n"
@@ -429,8 +408,6 @@ def turn_stream():
                     status = "STABLE"
 
                 print(f"[turn_stream] classified as {status} — now streaming question...")
-
-                # Stream the question in real time
                 question_tokens = []
                 for token in phi3_stream(build_question_prompt(history_text + f"\nPatient: {text}"), OLLAMA_OPTS_FAST):
                     question_tokens.append(token)
