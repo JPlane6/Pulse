@@ -8,7 +8,7 @@ import traceback
 import numpy as np
 import soundfile as sf
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 
 app = Flask(__name__)
 
@@ -274,6 +274,48 @@ def phi3(prompt, opts):
         return "DONE"
 
 
+def phi3_stream(prompt, opts):
+    """
+    Streaming version of phi3 - yields tokens as they arrive from Ollama.
+    """
+    try:
+        r = requests.post(
+            OLLAMA_URL,
+            json={
+                "model": TEXT_MODEL,
+                "prompt": prompt,
+                "stream": True,  # Enable streaming
+                "options": opts
+            },
+            stream=True,
+            timeout=60
+        )
+
+        r.raise_for_status()
+
+        for line in r.iter_lines():
+            if not line:
+                continue
+            
+            try:
+                chunk = json.loads(line.decode('utf-8'))
+                if 'response' in chunk:
+                    token = chunk['response']
+                    if token:
+                        yield token
+                
+                # Check if this is the last chunk
+                if chunk.get('done', False):
+                    break
+            
+            except json.JSONDecodeError:
+                continue
+
+    except Exception as e:
+        print(f"[ollama stream] Error: {repr(e)}")
+        traceback.print_exc()
+
+
 # ═══════════════════════════════════════════════════════════════════
 # QUESTION GENERATION
 # ═══════════════════════════════════════════════════════════════════
@@ -433,6 +475,152 @@ def turn():
         print(f"[turn] Error: {repr(e)}")
         traceback.print_exc()
 
+        return jsonify({
+            "text": "",
+            "status": "STABLE",
+            "question": "DONE",
+            "error": str(e)
+        }), 500
+
+
+@app.route("/turn_stream", methods=["POST"])
+def turn_stream():
+    """
+    Streaming SSE version of /turn endpoint.
+    Streams tokens as they arrive from Ollama, enabling real-time TTS.
+    """
+    try:
+        body = request.get_json(force=True, silent=True) or {}
+        
+        if not isinstance(body, dict):
+            return jsonify({
+                "text": "",
+                "status": "STABLE",
+                "question": "DONE",
+                "error": "invalid request body"
+            }), 400
+
+        audio_b64 = body.get("audio_b64", "")
+        history = body.get("history", [])
+
+        if not audio_b64:
+            return jsonify({
+                "text": "",
+                "status": "STABLE",
+                "question": "DONE",
+                "error": "missing audio_b64"
+            }), 400
+
+        try:
+            wav_bytes = base64.b64decode(audio_b64)
+        except Exception as e:
+            print("[b64 decode failed]", repr(e))
+            return jsonify({
+                "text": "",
+                "status": "STABLE",
+                "question": "DONE",
+                "error": "invalid base64"
+            }), 400
+
+        # Transcribe audio
+        text = transcribe_bytes(wav_bytes)
+
+        if not text:
+            def empty_generator():
+                yield f"data: {json.dumps({'done': True, 'text': '', 'status': 'STABLE', 'question': 'DONE'})}\n\n"
+            
+            return Response(empty_generator(), mimetype='text/event-stream')
+
+        history_text = "\n".join([
+            f"Nurse: {qa.get('q', '')}\nPatient: {qa.get('a', '')}"
+            for qa in history
+        ])
+
+        # Check for keyword-based fast status
+        fast_status = keyword_status(text)
+
+        def generate_stream():
+            """Generator function for SSE streaming"""
+            
+            if fast_status is not None:
+                # Fast path - stream next question
+                print(f"[turn_stream] fast path: {fast_status}")
+                
+                prompt = (
+                    "You are a calm triage assistant.\n"
+                    "Ask ONE short follow-up question not yet asked.\n"
+                    "Topics: main problem, pain level, duration, breathing, medications.\n"
+                    "Under 15 words.\n"
+                    "If enough info reply ONLY: DONE\n\n"
+                    f"Conversation:\n{history_text}\n\nAssistant:"
+                )
+                
+                question_tokens = []
+                for token in phi3_stream(prompt, OLLAMA_OPTS_FAST):
+                    question_tokens.append(token)
+                    # Send each token as SSE
+                    yield f"data: {json.dumps({'t': token})}\n\n"
+                
+                question = ''.join(question_tokens)
+                question = question.split("\n")[0].strip()
+                question = clean_question(question)
+                
+                # Send final done event
+                yield f"data: {json.dumps({'done': True, 'text': text, 'status': fast_status, 'question': question})}\n\n"
+            
+            else:
+                # AI assessment path - stream question generation in real-time
+                print(f"[turn_stream] AI assessment path - streaming")
+                
+                # Generate status classification (fast, non-streaming)
+                status_prompt = (
+                    "You are a triage nurse. Classify this patient response.\n\n"
+                    f"Patient: '{text}'\n\n"
+                    "Reply ONLY with one word: URGENT, MONITOR, or STABLE\n"
+                    "URGENT = severe chest pain, can't breathe, unconscious, pain 9-10\n"
+                    "MONITOR = moderate pain, dizziness, nausea, fever, pain 4-8\n"
+                    "STABLE = mild symptoms"
+                )
+                
+                status_raw = phi3(status_prompt, OLLAMA_OPTS_URGENT)
+                status = status_raw.upper().strip()
+                if status not in ["URGENT", "MONITOR", "STABLE"]:
+                    status = "STABLE"
+                
+                print(f"[turn_stream] classified as {status}, now streaming question...")
+                
+                # Stream the follow-up question in real-time
+                question_prompt = (
+                    "You are a calm triage assistant.\n"
+                    "Ask ONE short follow-up question not yet asked.\n"
+                    "Topics: main problem, pain level, duration, breathing, medications.\n"
+                    "Under 15 words.\n"
+                    "If enough info reply ONLY: DONE\n\n"
+                    f"Conversation:\n{history_text}\n"
+                    f"Patient: {text}\n\nAssistant:"
+                )
+                
+                question_tokens = []
+                for token in phi3_stream(question_prompt, OLLAMA_OPTS_FAST):
+                    question_tokens.append(token)
+                    # Stream each token immediately to client
+                    yield f"data: {json.dumps({'t': token})}\n\n"
+                
+                question = ''.join(question_tokens)
+                question = question.split("\n")[0].strip()
+                question = clean_question(question)
+                
+                print(f"[turn_stream] complete - status={status}, question='{question}'")
+                
+                # Send final done event with metadata
+                yield f"data: {json.dumps({'done': True, 'text': text, 'status': status, 'question': question})}\n\n"
+        
+        return Response(generate_stream(), mimetype='text/event-stream')
+
+    except Exception as e:
+        print(f"[turn_stream] Error: {repr(e)}")
+        traceback.print_exc()
+        
         return jsonify({
             "text": "",
             "status": "STABLE",
