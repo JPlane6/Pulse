@@ -341,18 +341,24 @@ def get_next_question_only(history_text):
 def assess_and_next(history_text, last_answer):
 
     prompt = (
-        "You are a clinical triage assistant.\n\n"
-        f"Conversation:\n{history_text}\n\n"
-        f"Patient answer: '{last_answer}'\n\n"
-        "Classify:\n"
-        "- URGENT = severe chest pain, cannot breathe, unconscious, pain 9-10\n"
-        "- MONITOR = moderate pain, dizziness, nausea, fever\n"
-        "- STABLE = mild symptoms\n\n"
-        "Ask ONE short follow-up question.\n"
-        "Under 15 words.\n"
-        "If enough info reply DONE.\n\n"
-        "Reply ONLY valid JSON:\n"
-        "{\"status\":\"URGENT|MONITOR|STABLE\",\"question\":\"text\"}"
+        "You are a clinical triage assistant for a nurse robot.\n\n"
+        f"Conversation so far:\n{history_text}\n\n"
+        f"The patient's latest answer: \"{last_answer}\"\n\n"
+        "Your job:\n"
+        "1. Classify the patient's latest answer as URGENT, MONITOR, or STABLE.\n"
+        "   URGENT = life-threatening: severe chest pain, cannot breathe, unconscious, "
+        "uncontrolled bleeding, seizure, stroke, pain 9-10/10.\n"
+        "   MONITOR = moderate concern: pain 4-8/10, fever, dizziness, nausea, "
+        "shortness of breath, confusion.\n"
+        "   STABLE = mild or no symptoms: pain 1-3/10, feeling okay.\n"
+        "   When in doubt, choose the less severe option.\n\n"
+        "2. Ask the single most important follow-up question not yet covered.\n"
+        "   Topics to cover: main problem, pain level, duration, breathing, "
+        "medical history, medications.\n"
+        "   If you have enough info, write DONE instead of a question.\n"
+        "   Keep questions under 15 words. Ask only one question.\n\n"
+        "Reply with ONLY valid JSON, no extra text, no markdown:\n"
+        "{\"status\": \"URGENT|MONITOR|STABLE\", \"question\": \"your question or DONE\"}"
     )
 
     raw = phi3(prompt, OLLAMA_OPTS_FAST)
@@ -362,16 +368,12 @@ def assess_and_next(history_text, last_answer):
     print("[phi3 parsed raw]", raw)
 
     try:
-
         parsed = json.loads(raw)
-
         status = parsed.get("status", "STABLE").upper().strip()
-
         question = parsed.get("question", "DONE").strip()
 
     except Exception:
         print("[phi3] JSON parse failed")
-
         status = "STABLE"
         question = "DONE"
 
