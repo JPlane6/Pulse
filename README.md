@@ -50,9 +50,9 @@ The MacBook handles all the AI. It runs a Flask web server that the Pi sends req
 |---|---|
 | Raspberry Pi 5 | Runs the robot — navigation, audio, motors, display, logging |
 | MacBook M2 (16GB RAM) | Runs the AI server — speech to text and question generation |
-| YDLidar X4 | Reads distances in all directions for navigation and room detection |
-| Arduino Mega + Adafruit Motor Shield | Controls the four drive motors based on commands from the Pi |
-| Logitech H570e USB Headset | Microphone for recording patient answers, speaker for TTS playback |
+| YDLidar X4 Pro | Reads distances in all directions for navigation and room detection |
+| Arduino UNO R3 + Adafruit Motor Shield (Ripoff) | Controls the four drive motors based on commands from the Pi |
+| USB Speaker | Microphone for recording patient answers, speaker for TTS playback |
 | 20x4 I2C LCD Screen | Shows live distances, navigation status, and triage results |
 
 ---
