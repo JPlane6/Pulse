@@ -30,7 +30,7 @@ SAMPLERATE           = 16000
 AUDIO_DEVICE_KEYWORD = "USB"
 PIPER_MODEL          = "/home/ayushs0604/Pulse/en_US-hfc_female-medium.onnx"
 
-VAD_THRESHOLD        = 0.70
+VAD_THRESHOLD        = 0.90
 VAD_SILENCE_DURATION = 1.5
 VAD_MAX_DURATION     = 15
 VAD_FRAME_SAMPLES    = 512
@@ -481,7 +481,7 @@ def save_log(session_dir, record_data):
 STATUS_PHRASES = {
     "URGENT":  "Your condition has been marked as urgent. A nurse is being alerted right now.",
     "MONITOR": "Your condition has been marked as monitor. A nurse will check on you shortly.",
-    "STABLE":  "Your condition has been marked as stable. You are doing okay.",
+    "STABLE":  "Your condition has been marked as stable. I'll be back in a bit, but call if you need anything.",
 }
 
 def announce_status(patient_name, status, flagged):

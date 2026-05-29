@@ -248,25 +248,28 @@ def phi3_stream(prompt, opts):
 # case where there's no "?" in the output (returns DONE).
 # ═══════════════════════════════════════════════════════════════════
 
-TOPIC_PROGRESSION = [
-    "1. Pain score 1-10",
-    "2. Location of pain or discomfort",
-    "3. How long this has been going on",
-    "4. Any difficulty breathing",
-    "5. Any medications or allergies",
-    "6. Any relevant medical history",
-]
 
 
-def build_question_prompt(history_text):
-    topics = "\n".join(TOPIC_PROGRESSION)
+def build_question_prompt(history_text, questions_asked=0, max_questions=6):
     return (
-        "You are a nurse robot doing a quick triage check-in.\n"
-        "Ask the single most important unanswered question from this list:\n\n"
-        f"{topics}\n\n"
-        "Skip topics already answered in the conversation below.\n"
-        "Rules: output ONLY the question. Under 12 words. Must end with a question mark.\n\n"
-        f"Conversation:\n{history_text}\n\n"
+        "You are a nurse robot doing a triage check-in.\n\n"
+        "Before you can stop, you MUST have collected ALL of the following from the patient:\n"
+        "  [A] Pain score (a number 1-10)\n"
+        "  [B] Location of the pain or discomfort\n"
+        "  [C] How long the issue has been going on\n"
+        "  [D] Whether they have any difficulty breathing\n"
+        "  [E] Any current medications or known allergies\n\n"
+        "Look at the conversation below and check which of [A]-[E] are already answered.\n"
+        "If ANY of [A]-[E] are still missing AND you have asked fewer than "
+        f"{max_questions} questions total (you have asked {questions_asked} so far), "
+        "ask the single most important missing one.\n"
+        "If ALL of [A]-[E] are answered, OR the patient is clearly in severe distress "
+        "(chest pain, can't breathe, pain 9-10, unconscious), output exactly: DONE\n\n"
+        "Rules:\n"
+        "- Output ONLY the question, nothing else. Under 12 words. Must end with ?.\n"
+        "- OR output exactly the word: DONE\n"
+        "- No explanations, no notes, no extra text.\n\n"
+        f"Conversation so far:\n{history_text}\n\n"
         "Question:"
     )
 
@@ -328,7 +331,7 @@ def turn():
 
         if fast_status is not None:
             question = clean_question(
-                phi3(build_question_prompt(history_text), OLLAMA_OPTS_FAST).split("\n")[0]
+                phi3(build_question_prompt(history_text, questions_asked=len(history)), OLLAMA_OPTS_FAST).split("\n")[0]
             )
             print(f"[turn] fast={fast_status} q='{question}'")
             return jsonify({"text": text, "status": fast_status, "question": question})
@@ -400,7 +403,7 @@ def turn_stream():
             if fast_status is not None:
                 print(f"[turn_stream] fast path: {fast_status}")
                 question_tokens = []
-                for token in phi3_stream(build_question_prompt(history_text), OLLAMA_OPTS_FAST):
+                for token in phi3_stream(build_question_prompt(history_text, questions_asked=len(history)), OLLAMA_OPTS_FAST):
                     question_tokens.append(token)
                     joined = "".join(question_tokens)
                     # Only yield tokens up to and including the "?"
@@ -434,7 +437,7 @@ def turn_stream():
                 print(f"[turn_stream] classified as {status} — streaming question...")
                 question_tokens = []
                 full_history = history_text + f"\nPatient: {text}"
-                for token in phi3_stream(build_question_prompt(full_history), OLLAMA_OPTS_FAST):
+                for token in phi3_stream(build_question_prompt(full_history, questions_asked=len(history)), OLLAMA_OPTS_FAST):
                     question_tokens.append(token)
                     yield f"data: {json.dumps({'t': token})}\n\n"
                     # Stop as soon as we've collected a complete question
