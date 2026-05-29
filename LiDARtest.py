@@ -9,7 +9,7 @@ laser.initialize()
 laser.turnOn()
 scan = ydlidar.LaserScan()
 time.sleep(2)
-print('Put hand on RIGHT side close (~15cm) and press Enter')
+print('Put hand on side close (~15cm) and press Enter')
 input()
 laser.doProcessSimple(scan)
 points = [(math.degrees(p.angle) % 360, p.range*100) for p in scan.points if 3 < p.range*100 < 25]
