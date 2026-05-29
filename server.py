@@ -22,7 +22,7 @@ SERVER_PORT = 5001
 
 OLLAMA_OPTS_FAST = {
     "temperature":    0.1,
-    "num_predict":    20,    # 20 tokens ≈ 10-12 words — just enough for one question
+    "num_predict":    25,
     "num_ctx":        512,
     "repeat_penalty": 1.3,
     "top_k":          20,
@@ -137,11 +137,12 @@ FILLER_PREFIXES = [
     "Of course.", "Certainly.", "Understood.", "Noted.",
 ]
 
-# Phrases that mean the model is done but phrased it wrong
+# Any of these in the output means "no more questions"
 DONE_SIGNALS = [
     "done", "no further", "no more", "enough information",
     "no other information", "sufficient information", "that's all",
-    "reply done", "i have enough", "no additional"
+    "reply done", "i have enough", "no additional", "if all", "all covered",
+    "all topics", "topics covered", "output done", "output: done",
 ]
 
 
@@ -155,21 +156,21 @@ def clean_question(q):
         if q.lower().startswith(filler.lower()):
             q = q[len(filler):].strip()
 
-    # If the model echoed a DONE signal instead of a question, catch it
+    # Catch leaked instructions / done signals
     q_lower = q.lower()
     for signal in DONE_SIGNALS:
         if signal in q_lower:
             return "DONE"
 
-    # Hard cut at first question mark — kills trailing instructions
+    # Hard cut at first question mark
     if "?" in q:
         q = q[:q.index("?") + 1].strip()
     else:
-        # No question mark at all — model didn't follow format, discard
+        # No question mark — model didn't comply, treat as DONE
         return "DONE"
 
-    # Final sanity guards
-    if not q or len(q) > 100:
+    # Sanity guards
+    if not q or len(q) > 120:
         return "DONE"
 
     return q
@@ -205,7 +206,8 @@ def phi3(prompt, opts):
 
 
 def phi3_stream(prompt, opts):
-    """Yields tokens as they arrive from Ollama."""
+    """Yields tokens as they arrive from Ollama. Stops early on '?'."""
+    full = []
     try:
         r = requests.post(
             OLLAMA_URL,
@@ -219,8 +221,14 @@ def phi3_stream(prompt, opts):
                 continue
             try:
                 chunk = json.loads(line.decode("utf-8"))
-                if "response" in chunk and chunk["response"]:
-                    yield chunk["response"]
+                token = chunk.get("response", "")
+                if token:
+                    full.append(token)
+                    yield token
+                    # Stop streaming as soon as we have a complete question
+                    joined = "".join(full)
+                    if "?" in joined:
+                        break
                 if chunk.get("done", False):
                     break
             except json.JSONDecodeError:
@@ -231,32 +239,21 @@ def phi3_stream(prompt, opts):
 
 
 # ═══════════════════════════════════════════════════════════════════
-# QUESTION PROMPTS
+# PROMPTS
 #
-# Key design decisions:
-#
-# 1. The topic list is ordered by priority. Phi3 is told to pick the
-#    FIRST uncovered topic — this forces a logical progression and
-#    prevents it from asking two similar pain questions in a row.
-#
-# 2. "Output ONLY the question" is the last line before the answer
-#    anchor ("Next question:") so it's the freshest instruction in
-#    context when Phi3 starts generating.
-#
-# 3. No mention of "DONE" in the question prompt at all — the only
-#    way "DONE" appears is if the model outputs it literally with no
-#    question mark, which clean_question catches. Mentioning DONE in
-#    the prompt was causing the model to echo the instruction.
+# KEY CHANGE: The question prompt NEVER mentions "DONE" at all.
+# Phi3 was reading "If all covered, output: DONE" and repeating it
+# verbatim as its answer. Now it only sees a simple instruction to
+# ask the next unanswered question. clean_question() handles the
+# case where there's no "?" in the output (returns DONE).
 # ═══════════════════════════════════════════════════════════════════
 
-# Ordered topic progression — Phi3 picks the first one not yet covered.
-# Ordering matters: pain score before location prevents double-asking.
 TOPIC_PROGRESSION = [
-    "1. Pain score 1-10 (if not given)",
-    "2. Where exactly is the pain or discomfort",
-    "3. How long has this been going on",
+    "1. Pain score 1-10",
+    "2. Location of pain or discomfort",
+    "3. How long this has been going on",
     "4. Any difficulty breathing",
-    "5. Any relevant medications or allergies",
+    "5. Any medications or allergies",
     "6. Any relevant medical history",
 ]
 
@@ -264,20 +261,19 @@ TOPIC_PROGRESSION = [
 def build_question_prompt(history_text):
     topics = "\n".join(TOPIC_PROGRESSION)
     return (
-        "You are a caring nurse robot doing a triage check-in.\n"
-        "Ask the next uncovered question from this ordered list:\n\n"
+        "You are a nurse robot doing a quick triage check-in.\n"
+        "Ask the single most important unanswered question from this list:\n\n"
         f"{topics}\n\n"
-        "Skip topics already answered. If all covered, output: DONE\n\n"
-        "Rules: one question, under 10 words, ends with ?, output ONLY the question.\n\n"
+        "Skip topics already answered in the conversation below.\n"
+        "Rules: output ONLY the question. Under 12 words. Must end with a question mark.\n\n"
         f"Conversation:\n{history_text}\n\n"
-        "Next question:"
+        "Question:"
     )
 
 
 def build_assess_prompt(history_text, last_answer):
-    topics = "\n".join(TOPIC_PROGRESSION)
     return (
-        "You are a caring clinical triage assistant for a nurse robot.\n\n"
+        "You are a clinical triage assistant for a nurse robot.\n\n"
         f"Conversation so far:\n{history_text}\n\n"
         f"Patient's latest answer: \"{last_answer}\"\n\n"
         "Classify the latest answer:\n"
@@ -287,12 +283,8 @@ def build_assess_prompt(history_text, last_answer):
         "            shortness of breath, confusion.\n"
         "  STABLE  = mild or no symptoms: pain 1-3/10, feeling generally okay.\n"
         "  When in doubt, choose the less severe option.\n\n"
-        "Then pick the next uncovered question from this list:\n\n"
-        f"{topics}\n\n"
-        "Rules: one question, under 10 words, ends with ?.\n"
-        "If all topics covered, use DONE.\n\n"
-        "Reply with ONLY valid JSON, no markdown:\n"
-        "{\"status\": \"URGENT|MONITOR|STABLE\", \"question\": \"your question or DONE\"}"
+        "Reply with ONLY valid JSON, no markdown, no extra text:\n"
+        "{\"status\": \"URGENT|MONITOR|STABLE\", \"question\": \"your next question ending with ?\"}"
     )
 
 
@@ -307,7 +299,7 @@ def ping():
 
 @app.route("/turn", methods=["POST"])
 def turn():
-    """Non-streaming fallback endpoint (kept for compatibility)."""
+    """Non-streaming fallback endpoint."""
     try:
         body = request.get_json(force=True, silent=True) or {}
         if not isinstance(body, dict):
@@ -370,8 +362,9 @@ def turn():
 def turn_stream():
     """
     Streaming SSE endpoint.
-    Transcribes audio, classifies status, then streams the next question
-    token-by-token so Piper TTS on the Pi can start speaking immediately.
+    Transcribes audio, classifies status, streams the next question
+    token-by-token so Piper can start speaking immediately.
+    Stops streaming as soon as a '?' is emitted to prevent bleed.
     """
     try:
         body = request.get_json(force=True, silent=True) or {}
@@ -409,7 +402,16 @@ def turn_stream():
                 question_tokens = []
                 for token in phi3_stream(build_question_prompt(history_text), OLLAMA_OPTS_FAST):
                     question_tokens.append(token)
+                    joined = "".join(question_tokens)
+                    # Only yield tokens up to and including the "?"
+                    if "?" in joined:
+                        # Yield everything up to the "?" then stop
+                        up_to_q = joined[:joined.index("?") + 1]
+                        # We've already been yielding token by token, so just send the final event
+                        yield f"data: {json.dumps({'t': token})}\n\n"
+                        break
                     yield f"data: {json.dumps({'t': token})}\n\n"
+
                 question = clean_question("".join(question_tokens).split("\n")[0].strip())
                 yield f"data: {json.dumps({'done': True, 'text': text, 'status': fast_status, 'question': question})}\n\n"
 
@@ -431,9 +433,13 @@ def turn_stream():
 
                 print(f"[turn_stream] classified as {status} — streaming question...")
                 question_tokens = []
-                for token in phi3_stream(build_question_prompt(history_text + f"\nPatient: {text}"), OLLAMA_OPTS_FAST):
+                full_history = history_text + f"\nPatient: {text}"
+                for token in phi3_stream(build_question_prompt(full_history), OLLAMA_OPTS_FAST):
                     question_tokens.append(token)
                     yield f"data: {json.dumps({'t': token})}\n\n"
+                    # Stop as soon as we've collected a complete question
+                    if "?" in "".join(question_tokens):
+                        break
 
                 question = clean_question("".join(question_tokens).split("\n")[0].strip())
                 print(f"[turn_stream] done — status={status}, question='{question}'")

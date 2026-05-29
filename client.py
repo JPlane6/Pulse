@@ -36,7 +36,9 @@ VAD_MAX_DURATION     = 15
 VAD_FRAME_SAMPLES    = 512
 RMS_GATE             = 150
 
-STREAM_CHUNK_WORDS   = 4
+# How many words to buffer before flushing a chunk to Piper.
+# Lowered to 2 so short questions don't get stuck waiting for more words.
+STREAM_CHUNK_WORDS   = 2
 
 LED_RED_PIN   = 17
 LED_GREEN_PIN = 27
@@ -49,13 +51,10 @@ CONFIG_PATH       = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mo
 os.makedirs(LOG_DIR, exist_ok=True)
 
 # ═══════════════════════════════════════════════════════════════════
-#  VAD — loaded in a background thread so it doesn't block the
-#  greeting.  speak_plain() runs immediately; record() waits for VAD
-#  to be ready only if it hasn't finished yet by the time the patient
-#  finishes speaking (which it always has — loading takes ~2s).
+#  VAD — background load so it doesn't block the greeting
 # ═══════════════════════════════════════════════════════════════════
-vad_model      = None
-_vad_ready     = threading.Event()
+vad_model  = None
+_vad_ready = threading.Event()
 
 def _load_vad_bg():
     global vad_model
@@ -106,7 +105,7 @@ def set_status_led(status_type):
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  AUDIO DEVICE CACHE — queried once at startup
+#  AUDIO DEVICE CACHE
 # ═══════════════════════════════════════════════════════════════════
 _native_sr       = None
 _pa_device_index = None
@@ -231,26 +230,43 @@ def speak_plain(text):
 def speak_stream(sse_response):
     """
     Consumes SSE token stream from /turn_stream, drives Piper in real time.
+
+    FIX 1: buf is flushed immediately when a '?' is seen — this ensures
+            the last word of a short question is never left hanging.
+    FIX 2: After the SSE loop exits, any remaining buf is always flushed
+            before _close_pipeline is called.
+    FIX 3: Tokens that contain DONE signals are dropped silently so
+            leaked prompt text never reaches Piper.
+
     Returns (transcribed_text, status, full_question).
     """
     text     = ""
     status   = "STABLE"
     question = "DONE"
 
+    # Signals from the server prompt that must never be spoken
+    MUTE_SIGNALS = [
+        "done", "if all", "all covered", "topics covered",
+        "output done", "output: done", "no further", "no more"
+    ]
+
     piper, aplay = _open_piper_pipeline()
-    buf   = ""
-    spoke = False
+    buf = ""
 
     def _flush(chunk):
-        nonlocal spoke
         chunk = chunk.strip()
         if not chunk:
             return
-        print(f"[tts-stream] chunk: '{chunk}'")
+        # Drop any chunk that looks like a leaked instruction
+        chunk_lower = chunk.lower()
+        for sig in MUTE_SIGNALS:
+            if sig in chunk_lower:
+                print(f"[tts-stream] MUTED leaked chunk: '{chunk}'")
+                return
+        print(f"[tts-stream] speaking: '{chunk}'")
         try:
-            piper.stdin.write((chunk + "\n").encode("utf-8"))
+            piper.stdin.write((chunk + " ").encode("utf-8"))
             piper.stdin.flush()
-            spoke = True
         except BrokenPipeError:
             pass
 
@@ -266,10 +282,8 @@ def speak_stream(sse_response):
             except Exception:
                 continue
 
+            # ── Final event — read metadata, stop streaming ────────
             if evt.get("done"):
-                if buf.strip() and buf.strip().upper() != "DONE":
-                    _flush(buf)
-                    buf = ""
                 text     = evt.get("text",     "")
                 status   = evt.get("status",   "STABLE")
                 question = evt.get("question", "DONE")
@@ -281,21 +295,23 @@ def speak_stream(sse_response):
 
             buf += token
 
-            # Flush on sentence boundary
+            # Flush immediately on sentence-ending punctuation
             if buf.rstrip()[-1:] in ".?!":
                 _flush(buf)
                 buf = ""
                 continue
 
-            # Flush on word boundary once enough words buffered
+            # Flush when we have enough words buffered
             if token.endswith(" ") and len(buf.split()) >= STREAM_CHUNK_WORDS:
                 _flush(buf)
                 buf = ""
 
     except Exception as e:
         print(f"[tts-stream] Stream error: {e}")
-        if buf.strip():
-            _flush(buf)
+
+    # ── FIX: always flush whatever is left in buf ──────────────────
+    if buf.strip():
+        _flush(buf)
 
     _close_pipeline(piper, aplay)
     return text, status, question
@@ -303,12 +319,9 @@ def speak_stream(sse_response):
 
 # ═══════════════════════════════════════════════════════════════════
 #  RECORD
-#  Waits for VAD to finish loading (non-blocking during greeting).
 # ═══════════════════════════════════════════════════════════════════
 
 def record(silence_duration=VAD_SILENCE_DURATION, max_duration=VAD_MAX_DURATION):
-    # Block here only if VAD isn't ready yet — in practice the greeting
-    # speech takes longer than VAD load time so this wait is usually 0ms.
     if not _vad_ready.is_set():
         print("[mic] Waiting for VAD to finish loading...")
         _vad_ready.wait()
@@ -461,6 +474,30 @@ def save_log(session_dir, record_data):
 
 
 # ═══════════════════════════════════════════════════════════════════
+#  STATUS ANNOUNCEMENT
+#  Spoken at the very end of every session, before the robot moves on.
+# ═══════════════════════════════════════════════════════════════════
+
+STATUS_PHRASES = {
+    "URGENT":  "Your condition has been marked as urgent. A nurse is being alerted right now.",
+    "MONITOR": "Your condition has been marked as monitor. A nurse will check on you shortly.",
+    "STABLE":  "Your condition has been marked as stable. You are doing okay.",
+}
+
+def announce_status(patient_name, status, flagged):
+    """Speak the triage result out loud."""
+    if flagged or status == "URGENT":
+        phrase = STATUS_PHRASES["URGENT"]
+    elif status == "MONITOR":
+        phrase = STATUS_PHRASES["MONITOR"]
+    else:
+        phrase = STATUS_PHRASES["STABLE"]
+
+    speak_plain(f"{patient_name}, {phrase}")
+    speak_plain("Feel better soon.")
+
+
+# ═══════════════════════════════════════════════════════════════════
 #  MAIN
 # ═══════════════════════════════════════════════════════════════════
 
@@ -511,9 +548,6 @@ def main():
     status   = "STABLE"
 
     # ── First question ──────────────────────────────────────────────
-    # VAD is loading in the background right now. speak_plain takes a
-    # few seconds — by the time it finishes, VAD will be ready and
-    # record() will not block at all.
     first_q = f"Hello {patient_name}! I am Pulse. What's bothering you today?"
     speak_plain(first_q)
 
@@ -566,12 +600,11 @@ def main():
 
     if flagged:
         status = "URGENT"
-        set_status_led("URGENT")
-        speak_plain(f"Based on your responses {patient_name}, I am alerting a nurse immediately.")
-    else:
-        speak_plain(f"Thank you {patient_name}. Your assessment is complete.")
 
-    speak_plain("Feel better soon.")
+    set_status_led(status)
+
+    # ── Announce the result out loud ────────────────────────────────
+    announce_status(patient_name, status, flagged)
 
     show_status_on_lcd(lcd, status, flagged)
     save_log(session_dir, {
@@ -579,6 +612,7 @@ def main():
         "triage":     {"final_status": status, "flagged_urgent": flagged},
         "assessment": history
     })
+    print(f"[main] Session complete. Status={status} Flagged={flagged}")
 
 
 if __name__ == "__main__":
