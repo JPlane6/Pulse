@@ -7,12 +7,13 @@ def hello():
     try:
         lcd.clear()
         lcd.cursor_pos = (0, 0)
-        lcd.write_string("HELLO,")
+        lcd.write_string("HELLO EVERYONE, ")
         lcd.cursor_pos = (1, 0)
-        lcd.write_string("BRAINY BADGERS! ")
-        lcd.cursor_pos = (2, 0)
-        lcd.cursor_pos = (3, 0)
         lcd.write_string("I AM PULSE!")
+        lcd.cursor_pos = (2, 0)
+        lcd.write_string("BY THE")
+        lcd.cursor_pos = (3, 0)
+        lcd.write_string("BRAINY BADGERS!")
         time.sleep(5)
         lcd.clear()
 
