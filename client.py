@@ -29,17 +29,25 @@ SAMPLERATE           = 16000
 AUDIO_DEVICE_KEYWORD = "USB"
 PIPER_MODEL          = "/home/ayushs0604/Pulse/en_US-hfc_female-medium.onnx"
 
+<<<<<<< Updated upstream
 # VAD tuning — tighter silence so it returns faster after speech ends
 VAD_THRESHOLD        = 0.85          # slightly lower = more sensitive
 VAD_SILENCE_DURATION = 0.8           # was 1.2 — cuts dead air faster
+=======
+VAD_THRESHOLD        = 0.90
+VAD_SILENCE_DURATION = 1.2
+>>>>>>> Stashed changes
 VAD_MAX_DURATION     = 12
 VAD_FRAME_SAMPLES    = 512
 RMS_GATE             = 120           # was 150 — catches quieter speech
 
+<<<<<<< Updated upstream
 # Urgency thresholds — need multiple signals before escalating
 URGENT_THRESHOLD     = 3             # answers classified URGENT before flagging
 MONITOR_THRESHOLD    = 2             # answers classified MONITOR before flagging
 
+=======
+>>>>>>> Stashed changes
 LED_RED_PIN   = 17
 LED_GREEN_PIN = 27
 LED_BLUE_PIN  = 22
@@ -181,9 +189,23 @@ def get_patient_name(cfg): return "".join(w.capitalize() for w in cfg.get("patie
 # ═══════════════════════════════════════════════════════════════════
 #  TTS
 #
+<<<<<<< Updated upstream
 #  Both functions use a fresh Piper+aplay pair per call.
 #  aplay.wait() is a real OS signal — no sleep guessing.
 #  0.2s pause after is just a natural breath gap.
+=======
+#  speak_plain  — blocking, used for fixed phrases (greeting, closing).
+#                 Opens a fresh Piper+aplay pair, writes text, waits for
+#                 aplay to fully drain before returning. Guaranteed done.
+#
+#  speak_stream — used for AI-generated follow-up questions. Streams
+#                 tokens from the SSE response into Piper as they arrive
+#                 so speech starts almost immediately. Also waits for
+#                 aplay to drain before returning.
+#
+#  Both use a fresh subprocess pair per call so aplay.wait() gives a
+#  real "audio finished" signal with no timing guesswork.
+>>>>>>> Stashed changes
 # ═══════════════════════════════════════════════════════════════════
 
 def _open_pipeline():
@@ -207,9 +229,15 @@ def _close_pipeline(piper, aplay):
         piper.stdin.close()
     except Exception:
         pass
+<<<<<<< Updated upstream
     aplay.wait()    # blocks until audio is fully played — guaranteed done
     piper.wait()
     time.sleep(0.2) # short breath pause before mic opens
+=======
+    aplay.wait()   # real blocking wait — audio is done when this returns
+    piper.wait()
+    time.sleep(0.3)  # short breath pause before mic opens
+>>>>>>> Stashed changes
 
 
 def speak_plain(text):
@@ -227,6 +255,7 @@ def speak_plain(text):
 
 def speak_stream(sse_response):
     """
+<<<<<<< Updated upstream
     Streams SSE tokens from /turn_stream into Piper as they arrive.
     Flushes to Piper only on sentence-ending punctuation so Piper gets
     full sentence context for natural prosody — no word-by-word feeding.
@@ -234,15 +263,29 @@ def speak_stream(sse_response):
 
     Returns (transcribed_text, status, next_question).
     The next_question is NOT spoken here — caller decides what to do with it.
+=======
+    Consumes SSE token stream from /turn_stream.
+    Pipes tokens into Piper as they arrive — speech starts fast.
+    Waits for audio to fully finish before returning.
+    Returns (transcribed_text, status, next_question).
+>>>>>>> Stashed changes
     """
     text     = ""
     status   = "STABLE"
     question = "DONE"
 
+<<<<<<< Updated upstream
     MUTE_SIGNALS = [
         "done", "if all", "all covered", "topics covered",
         "output done", "output: done", "no further", "no more",
         "question:", "rules:", "conversation:", "nurse:", "patient:"
+=======
+    # Tokens we should never let Piper speak — model leakage
+    MUTE_SIGNALS = [
+        "done", "if all", "all covered", "topics covered",
+        "output done", "output: done", "no further", "no more",
+        "question:", "rules:", "conversation:"
+>>>>>>> Stashed changes
     ]
 
     piper, aplay = _open_pipeline()
@@ -287,7 +330,12 @@ def speak_stream(sse_response):
 
             buf += token
 
+<<<<<<< Updated upstream
             # Only flush on sentence boundaries — Piper needs context
+=======
+            # Flush on sentence-ending punctuation — gives Piper full
+            # sentence context for natural prosody
+>>>>>>> Stashed changes
             if buf.rstrip()[-1:] in ".?!":
                 _flush(buf)
                 buf = ""
@@ -295,6 +343,10 @@ def speak_stream(sse_response):
     except Exception as e:
         print(f"[tts-stream] error: {e}")
 
+<<<<<<< Updated upstream
+=======
+    # Flush any remaining buffer
+>>>>>>> Stashed changes
     if buf.strip():
         _flush(buf)
 
@@ -303,7 +355,15 @@ def speak_stream(sse_response):
 
 
 def consume_stream_silent(sse_response):
+<<<<<<< Updated upstream
     """Drains SSE stream without speaking. Returns (text, status, question)."""
+=======
+    """
+    Drains an SSE stream without speaking. Used in the follow-up loop
+    when we already spoke the question via speak_plain and just need
+    the metadata (transcribed text, status, next question).
+    """
+>>>>>>> Stashed changes
     text     = ""
     status   = "STABLE"
     question = "DONE"
@@ -331,12 +391,20 @@ def consume_stream_silent(sse_response):
 # ═══════════════════════════════════════════════════════════════════
 #  RECORD
 #
+<<<<<<< Updated upstream
 #  Starts listening immediately after TTS finishes (aplay.wait() means
 #  we're already done speaking). 300ms settling eats any room reverb.
 #  Returns as soon as 0.8s of silence detected — much snappier than 1.2s.
+=======
+#  Records until VAD detects end of speech or max duration hit.
+#  Has a 500ms settling period at the start so it doesn't pick up
+#  the tail end of the robot's own TTS output.
+>>>>>>> Stashed changes
 # ═══════════════════════════════════════════════════════════════════
 
 def record(silence_duration=VAD_SILENCE_DURATION, max_duration=VAD_MAX_DURATION):
+    # VAD loads in background during the greeting — by the time the
+    # patient starts answering it's always ready. This wait is ~0ms.
     if not _vad_ready.is_set():
         print("[mic] Waiting for VAD...")
         _vad_ready.wait()
@@ -344,8 +412,12 @@ def record(silence_duration=VAD_SILENCE_DURATION, max_duration=VAD_MAX_DURATION)
     hw_blocksize        = int(VAD_FRAME_SAMPLES * (_native_sr / SAMPLERATE))
     silence_frames_need = int(silence_duration * _native_sr / hw_blocksize)
     max_frames          = int(max_duration * _native_sr / hw_blocksize)
+<<<<<<< Updated upstream
     # 300ms settling — eats room reverb from TTS, but starts fast
     settling_frames     = int(0.3 * _native_sr / hw_blocksize)
+=======
+    settling_frames     = int(0.5 * _native_sr / hw_blocksize)  # 500ms echo guard
+>>>>>>> Stashed changes
 
     frames           = []
     silent_frames    = 0
@@ -362,7 +434,11 @@ def record(silence_duration=VAD_SILENCE_DURATION, max_duration=VAD_MAX_DURATION)
                 frame   = raw.flatten()
                 frame_count += 1
 
+<<<<<<< Updated upstream
                 # Discard settling frames without appending
+=======
+                # Discard settling frames — don't append them
+>>>>>>> Stashed changes
                 if frame_count <= settling_frames:
                     continue
 
@@ -544,6 +620,7 @@ def announce_status(patient_name, status, flagged):
 # ═══════════════════════════════════════════════════════════════════
 #  MAIN
 #
+<<<<<<< Updated upstream
 #  Q1: speak greeting → record → turn_stream → speak_stream speaks
 #      the AI's first follow-up question live. next_q comes back from
 #      speak_stream but is NOT spoken yet.
@@ -558,6 +635,17 @@ def announce_status(patient_name, status, flagged):
 #    - AI returns DONE (all info collected — clean exit)
 #    - MAX_QUESTIONS reached
 #    - Server unreachable
+=======
+#  Turn structure:
+#    Q1 (greeting + first question) → speak_stream speaks the AI response
+#    Q2-Q6 → speak_plain asks the question, consume_stream_silent gets next Q
+#
+#  Why the split:
+#    On Q1 we don't know the next question yet so we have to stream it live.
+#    On Q2+ we already have next_q from the previous turn, so we speak it
+#    immediately with speak_plain (faster, cleaner) and fire off the server
+#    call in parallel to get the one after that.
+>>>>>>> Stashed changes
 # ═══════════════════════════════════════════════════════════════════
 
 def main():
@@ -607,8 +695,14 @@ def main():
     history = []
     status  = "STABLE"
 
+<<<<<<< Updated upstream
     # ── Q1 ─────────────────────────────────────────────────────────
     # VAD loads during speak_plain — by the time we hit record() it's ready.
+=======
+    # ── Q1: greeting + open question ──────────────────────────────
+    # VAD is loading in background right now. speak_plain takes a few
+    # seconds — by the time it finishes VAD is always ready.
+>>>>>>> Stashed changes
     first_q = f"Hello {patient_name}! I am Pulse. What's bothering you today?"
     speak_plain(first_q)
 
@@ -618,11 +712,16 @@ def main():
         print("[main] Server unreachable on Q1.")
         return
 
+<<<<<<< Updated upstream
     # speak_stream speaks the AI follow-up live as tokens stream in.
     # next_q is the question that was spoken — we'll use it as the label
     # for Q2 in history, but we do NOT speak it again.
+=======
+    # speak_stream speaks the AI's follow-up question live as tokens arrive
+>>>>>>> Stashed changes
     answer, answer_status, next_q = speak_stream(sse)
 
+<<<<<<< Updated upstream
     print(f"[transcription] '{answer}'")
     history.append({"q": first_q, "a": answer, "status": answer_status})
     status = compute_session_status(history)
@@ -630,16 +729,26 @@ def main():
     print(f"[status] {status}  (urgent={sum(1 for q in history if q['status']=='URGENT')} monitor={sum(1 for q in history if q['status']=='MONITOR')})")
 
     # ── Q2-Q6 ──────────────────────────────────────────────────────
+=======
+    # ── Q2-Q6: follow-up loop ─────────────────────────────────────
+>>>>>>> Stashed changes
     for i in range(MAX_QUESTIONS - 1):
         if not next_q or next_q.strip().upper() == "DONE":
             print("[main] AI signalled DONE — all info collected.")
             break
 
         print(f"\n--- Q{i+2}/{MAX_QUESTIONS}: '{next_q}' ---")
+<<<<<<< Updated upstream
 
         # Speak the question we already have — fires immediately
         speak_plain(next_q)
+=======
+>>>>>>> Stashed changes
 
+        # Speak the question we already have — no waiting on server
+        speak_plain(next_q)
+
+        # Record patient answer
         audio = record()
         sse   = turn_stream(audio, history)
         if sse is None:
@@ -647,7 +756,11 @@ def main():
             break
 
         prev_q = next_q
+<<<<<<< Updated upstream
         # Silent drain — get transcription, status, next question
+=======
+        # Silent drain — just get transcription, status, and next question
+>>>>>>> Stashed changes
         answer, answer_status, next_q = consume_stream_silent(sse)
 
         print(f"[transcription] '{answer}'")
@@ -656,6 +769,15 @@ def main():
         set_status_led(status)
         print(f"[status] {status}  (urgent={sum(1 for q in history if q['status']=='URGENT')} monitor={sum(1 for q in history if q['status']=='MONITOR')})")
 
+<<<<<<< Updated upstream
+=======
+        # Early exit if two consecutive urgent answers
+        urgent_streak = sum(1 for qa in history[-2:] if qa.get("status") == "URGENT")
+        if urgent_streak >= 2:
+            print("[main] Two consecutive URGENT — ending early.")
+            break
+
+>>>>>>> Stashed changes
     # ── Final decision ─────────────────────────────────────────────
     print("\n--- Finalizing ---")
     flagged = check_urgent(history)

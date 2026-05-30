@@ -7,6 +7,11 @@ __pycache__/
 *.pyc
 *.pyo
 
+# Documentation and guides
+CHANGES_SUMMARY.md
+OPTIMIZATION_GUIDE.md
+COMMUNICATION_FIX_SUMMARY.md
+
 # TTS Models
 en_US-hfc_female-medium.onnx
 en_US-hfc_female-medium.onnx.json
