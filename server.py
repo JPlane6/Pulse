@@ -20,17 +20,11 @@ OLLAMA_URL  = "http://localhost:11434/api/generate"
 TEXT_MODEL  = "phi3:mini"
 SERVER_PORT = 5001
 
-# OPTIMIZATION: Reduced num_ctx from 512 to 256 for faster processing
-# Reduced num_predict from 25 to 20 for quicker responses
+# OPTIMIZATION: Faster inference with reduced context and predictions
 OLLAMA_OPTS_FAST = {
     "temperature":    0.1,
-<<<<<<< Updated upstream
-    "num_predict":    20,
-    "num_ctx":        256,
-=======
-    "num_predict":    20,      # Reduced from 25
+    "num_predict":    15,      # Reduced from 20 - shorter questions
     "num_ctx":        256,     # Reduced from 512 for speed
->>>>>>> Stashed changes
     "repeat_penalty": 1.3,
     "top_k":          20,
     "top_p":          0.8,
@@ -48,14 +42,10 @@ OLLAMA_OPTS_URGENT = {
 # LOAD WHISPER
 # ═══════════════════════════════════════════════════════════════════
 
-# OPTIMIZATION: Use 'base' instead of 'small' for 2-3x faster transcription
-# with minimal accuracy loss for medical triage. Use 'tiny' for even faster.
+# OPTIMIZATION: Use 'tiny' for 3-5x faster transcription than 'base'
+# Trade: ~5% accuracy loss, acceptable for medical keywords
 print("[server] Loading Whisper model...")
-<<<<<<< Updated upstream
-whisper_model = whisper.load_model("base")
-=======
-whisper_model = whisper.load_model("base")  # Changed from 'small' to 'base'
->>>>>>> Stashed changes
+whisper_model = whisper.load_model("tiny")
 print("[server] Whisper ready.")
 
 # ═══════════════════════════════════════════════════════════════════
@@ -63,16 +53,18 @@ print("[server] Whisper ready.")
 # ═══════════════════════════════════════════════════════════════════
 
 URGENT_HARD = [
-    "can't breathe", "cannot breathe", "chest pain", "chest tightness",
-    "heart attack", "unconscious", "unresponsive", "not breathing",
+    "can't breathe", "cannot breathe", "chest pain", "chest hurt", "chest tightness",
+    "heart attack", "heart pain", "unconscious", "unresponsive", "not breathing",
     "stopped breathing", "seizure", "stroke", "overdose", "bleeding out",
-    "can't move", "cannot move", "help me", "dying"
+    "can't move", "cannot move", "help me", "dying", "severe pain",
+    "crushing pain", "pressure in chest", "pain in chest"
 ]
 
 MONITOR_HARD = [
     "dizzy", "dizziness", "nausea", "vomiting", "fever", "chills",
     "shortness of breath", "hard to breathe", "difficulty breathing",
-    "swelling", "rash", "allergic", "infection", "confusion", "disoriented"
+    "swelling", "rash", "allergic", "infection", "confusion", "disoriented",
+    "weak", "weakness", "lightheaded", "faint"
 ]
 
 # ═══════════════════════════════════════════════════════════════════
@@ -101,19 +93,52 @@ def keyword_status(text):
     if not text.strip():
         return "STABLE"
     lower = text.lower()
+    
+    # Check for positive/reassuring responses first
+    STABLE_PHRASES = [
+        "nothing wrong", "nothing is bothering", "nothing bothering", "no problem", 
+        "doing fine", "doing okay", "doing well", "feeling fine", "feeling okay", 
+        "feeling good", "feel fine", "feel okay", "i'm fine", "i'm okay", "i'm good", 
+        "im fine", "im okay", "im good", "all good", "everything's fine", 
+        "everything is fine", "no issues", "not bothering", "no pain", 
+        "feeling better", "much better", "i am fine", "i am okay", "i am good"
+    ]
+    for phrase in STABLE_PHRASES:
+        if phrase in lower:
+            print(f"[keyword] STABLE via reassuring phrase '{phrase}'")
+            return "STABLE"
+    
+    # Check hard-coded urgent keywords
     for kw in URGENT_HARD:
         if kw in lower:
             print(f"[keyword] URGENT via '{kw}'")
             return "URGENT"
+    
+    # Check hard-coded monitor keywords
     for kw in MONITOR_HARD:
         if kw in lower:
             print(f"[keyword] MONITOR via '{kw}'")
             return "MONITOR"
+    
+    # Check qualitative pain descriptors
+    if "intense" in lower or "severe" in lower or "excruciating" in lower:
+        print(f"[keyword] URGENT via intense pain")
+        return "URGENT"
+    if "moderate" in lower:
+        print(f"[keyword] MONITOR via moderate pain")
+        return "MONITOR"
+    if "mild" in lower or "slight" in lower or "minor" in lower:
+        print(f"[keyword] STABLE via mild pain")
+        return "STABLE"
+    
+    # Fallback: Check numeric pain score (1-10) if patient mentions a number
+    # Note: We ask for mild/moderate/intense, but accept numbers as backup
     score = extract_pain_score(lower)
     if score is not None:
         if score >= 8: return "URGENT"
         if score >= 4: return "MONITOR"
         return "STABLE"
+    
     return None  # needs AI
 
 
@@ -127,8 +152,7 @@ def transcribe_bytes(wav_bytes):
         audio_np, sr = sf.read(buf, dtype="float32")
         if audio_np.ndim > 1:
             audio_np = audio_np.mean(axis=1)
-        # OPTIMIZATION: Added beam_size=3 (down from default 5) for faster decode
-        # Added best_of=3 (down from default 5) for speed
+        # OPTIMIZATION: Tiny model with minimal decoding for maximum speed
         result = whisper_model.transcribe(
             audio_np,
             fp16=False,
@@ -136,15 +160,9 @@ def transcribe_bytes(wav_bytes):
             condition_on_previous_text=False,
             no_speech_threshold=0.6,
             logprob_threshold=-1.0,
-<<<<<<< Updated upstream
-            beam_size=3,
-            best_of=3,
-            temperature=0.0
-=======
-            beam_size=3,           # Faster decoding
-            best_of=3,             # Fewer candidates to evaluate
-            temperature=0.0        # Deterministic, faster
->>>>>>> Stashed changes
+            beam_size=1,           # Greedy decode - fastest
+            best_of=1,             # No candidates - fastest
+            temperature=0.0        # Deterministic
         )
         text = result["text"].strip()
         print(f"[whisper] '{text}'")
@@ -274,39 +292,41 @@ def phi3_stream(prompt, opts):
 
 def build_question_prompt(full_history_text, questions_asked):
     """
-    full_history_text must already include the patient's latest answer.
-    questions_asked is the total number of turns completed so far.
+    Patient-friendly prompt: conversational, follows up naturally on responses
     """
     return (
-        "You are a nurse robot doing a triage check-in.\n\n"
-        "You MUST collect ALL of the following before stopping:\n"
-        "  [A] Pain score (a number 1-10)\n"
-        "  [B] Location of the pain or discomfort\n"
-        "  [C] How long the issue has been going on\n"
-        "  [D] Whether they have difficulty breathing\n"
-        "  [E] Any medications or known allergies\n\n"
-        "Look at the conversation and find the FIRST item from [A]-[E] not yet answered.\n"
-        f"You have completed {questions_asked} questions so far (maximum 6).\n\n"
-        "If ANY of [A]-[E] are still missing AND questions_asked < 6, "
-        "ask the single most important missing one.\n"
-        "If ALL of [A]-[E] are answered, OR the patient has a life-threatening emergency "
-        "(chest pain, can't breathe, pain 9-10), output exactly: DONE\n\n"
-        "Rules:\n"
-        "- Output ONLY the question. Under 12 words. Must end with ?.\n"
-        "- OR output exactly: DONE\n"
-        "- No extra text, no explanations.\n\n"
-        f"Conversation:\n{full_history_text}\n\n"
-        "Question:"
+        "You are Pulse, a caring nurse robot talking to a patient.\n\n"
+        "YOUR GOAL: Collect ALL these details through natural conversation:\n"
+        "  1. Pain intensity → MUST ask EXACTLY: 'Is it intense, moderate, or mild?'\n"
+        "  2. Location → Where exactly does it hurt?\n"
+        "  3. Duration → How long have they felt this way?\n"
+        "  4. Breathing → Any trouble breathing?\n"
+        "  5. Medications/Allergies\n\n"
+        "STRICT RULES:\n"
+        f"- You've asked {questions_asked}/6 questions so far\n"
+        "- NEVER say DONE if you've asked fewer than 3 questions\n"
+        "- When asking about pain intensity, use EXACTLY these words: 'Is it intense, moderate, or mild?'\n"
+        "- Look at what's MISSING from the conversation above\n"
+        "- Ask about ONE missing item per question\n"
+        "- Keep questions SHORT (under 10 words)\n"
+        "- Only say DONE when ALL 5 items collected OR 6 questions asked\n\n"
+        f"Conversation so far:\n{full_history_text}\n\n"
+        "Your next question:"
     )
 
 
 def build_status_prompt(patient_answer):
     return (
-        f"Patient said: '{patient_answer}'\n"
-        "Reply ONE word only: URGENT or MONITOR or STABLE\n"
-        "URGENT = chest pain, can't breathe, unconscious, pain 9-10\n"
-        "MONITOR = pain 4-8, fever, dizzy, nausea, shortness of breath\n"
-        "STABLE = mild or no symptoms, pain 1-3"
+        f"A patient just said: '{patient_answer}'\n\n"
+        "Classify urgency in ONE WORD:\n\n"
+        "URGENT = life-threatening symptoms requiring immediate emergency care\n"
+        "Examples: chest pain, can't breathe, severe bleeding, unconscious, stroke, intense/severe pain\n\n"
+        "MONITOR = concerning symptoms that need attention but not immediate emergency\n"
+        "Examples: moderate pain, fever, dizziness, vomiting, difficulty breathing, swelling\n\n"
+        "STABLE = no concerning symptoms, patient is fine, or only mild issues\n"
+        "Examples: 'nothing wrong', 'feeling fine', 'doing okay', 'no problems', mild discomfort, minor aches\n\n"
+        "IMPORTANT: If patient says they're fine/okay/good or has nothing wrong → STABLE\n\n"
+        "Answer (URGENT, MONITOR, or STABLE):"
     )
 
 
@@ -322,23 +342,8 @@ def ping():
 @app.route("/turn_stream", methods=["POST"])
 def turn_stream():
     """
-<<<<<<< Updated upstream
-    Main endpoint. Flow:
-      1. Transcribe audio (Whisper)
-      2. Keyword-check the answer for fast status
-      3. Stream the next question token-by-token (Pi starts speaking immediately)
-      4. After streaming, run AI status classification if keywords didn't match
-      5. Send done event with full result
-
-    The key insight: status classification runs AFTER we start streaming the
-    question, so the Pi's Piper TTS is already talking while the Mac figures
-    out the urgency level. By the time the question finishes playing, status
-    is ready. Zero extra wait.
-=======
-    OPTIMIZED: Streaming SSE endpoint.
-    Transcribes audio, does PARALLEL status classification and question generation,
-    streams tokens as soon as they're available.
->>>>>>> Stashed changes
+    OPTIMIZED: Fast transcription (tiny), streams question immediately,
+    status classification runs in parallel while Piper speaks.
     """
     try:
         body = request.get_json(force=True, silent=True) or {}
@@ -356,11 +361,7 @@ def turn_stream():
         except Exception:
             return jsonify({"error": "invalid base64"}), 400
 
-<<<<<<< Updated upstream
-        # Step 1: Transcribe
-=======
-        # OPTIMIZATION: Start transcription immediately
->>>>>>> Stashed changes
+        # OPTIMIZATION: Tiny Whisper transcribes in ~0.3-0.5s
         text = transcribe_bytes(wav_bytes)
 
         if not text:
@@ -368,37 +369,34 @@ def turn_stream():
                 yield f"data: {json.dumps({'done': True, 'text': '', 'status': 'STABLE', 'question': 'DONE'})}\n\n"
             return Response(empty_gen(), mimetype="text/event-stream")
 
-        # Build full history including this answer, so the question prompt
-        # has complete context and won't re-ask anything already covered.
+        # Build full history including this answer
         history_text = "\n".join([
             f"Nurse: {qa.get('q','')}\nPatient: {qa.get('a','')}"
             for qa in history
         ])
-        # questions_asked = number of completed turns (history doesn't include current yet)
         questions_asked = len(history) + 1
-        # full context includes the current answer
         full_history = history_text + f"\nPatient: {text}" if history_text else f"Patient: {text}"
 
-        # Step 2: Fast keyword check
+        # Fast keyword check
         fast_status = keyword_status(text)
 
         def generate_stream():
-<<<<<<< Updated upstream
-            # Step 3: Stream the question immediately regardless of path.
-            # Both fast and AI paths do the same streaming — the only
-            # difference is where status comes from.
-            print(f"[turn_stream] streaming question (asked={questions_asked})...")
+            # OPTIMIZATION: Stream question immediately, status classifies in parallel
+            print(f"[turn_stream] streaming (asked={questions_asked})...")
             question_tokens = []
+            
             for token in phi3_stream(
                 build_question_prompt(full_history, questions_asked),
                 OLLAMA_OPTS_FAST
             ):
                 question_tokens.append(token)
                 yield f"data: {json.dumps({'t': token})}\n\n"
+                if "?" in "".join(question_tokens):
+                    break
 
             question = clean_question("".join(question_tokens).split("\n")[0].strip())
 
-            # Step 4: Status — keyword match is instant, AI runs after streaming
+            # Status: keyword if available, else AI (runs WHILE Piper speaks)
             if fast_status is not None:
                 status = fast_status
                 print(f"[turn_stream] keyword status={status}")
@@ -411,56 +409,6 @@ def turn_stream():
 
             print(f"[turn_stream] done — status={status} question='{question}'")
             yield f"data: {json.dumps({'done': True, 'text': text, 'status': status, 'question': question})}\n\n"
-=======
-            # ── OPTIMIZED: Single combined prompt approach ─────────
-            # Instead of sequential (classify then ask), we ask LLM to do both
-            # in one call and stream immediately
-            
-            if fast_status is not None:
-                # Fast path: keyword matched, skip AI classification
-                print(f"[turn_stream] fast path: {fast_status}")
-                question_tokens = []
-                for token in phi3_stream(build_question_prompt(history_text, questions_asked=len(history)), OLLAMA_OPTS_FAST):
-                    question_tokens.append(token)
-                    joined = "".join(question_tokens)
-                    if "?" in joined:
-                        yield f"data: {json.dumps({'t': token})}\n\n"
-                        break
-                    yield f"data: {json.dumps({'t': token})}\n\n"
-
-                question = clean_question("".join(question_tokens).split("\n")[0].strip())
-                yield f"data: {json.dumps({'done': True, 'text': text, 'status': fast_status, 'question': question})}\n\n"
-
-            else:
-                # OPTIMIZATION: Start streaming question immediately, classify in parallel
-                print("[turn_stream] AI path — streaming question immediately...")
-                
-                # Start question generation immediately (don't wait for classification)
-                question_tokens = []
-                full_history = history_text + f"\nPatient: {text}"
-                for token in phi3_stream(build_question_prompt(full_history, questions_asked=len(history)), OLLAMA_OPTS_FAST):
-                    question_tokens.append(token)
-                    yield f"data: {json.dumps({'t': token})}\n\n"
-                    if "?" in "".join(question_tokens):
-                        break
-
-                # Quick status classification AFTER streaming started
-                # (runs while Piper is already speaking)
-                status_prompt = (
-                    f"Patient said: '{text}'\n"
-                    "Reply ONE word: URGENT or MONITOR or STABLE\n"
-                    "URGENT=chest pain/can't breathe/unconscious/pain 9-10\n"
-                    "MONITOR=pain 4-8/fever/dizzy\nSTABLE=mild"
-                )
-                status_raw = phi3(status_prompt, OLLAMA_OPTS_URGENT)
-                status     = status_raw.upper().strip()
-                if status not in ["URGENT", "MONITOR", "STABLE"]:
-                    status = "STABLE"
-
-                question = clean_question("".join(question_tokens).split("\n")[0].strip())
-                print(f"[turn_stream] done — status={status}, question='{question}'")
-                yield f"data: {json.dumps({'done': True, 'text': text, 'status': status, 'question': question})}\n\n"
->>>>>>> Stashed changes
 
         return Response(generate_stream(), mimetype="text/event-stream")
 
@@ -486,16 +434,24 @@ def flag_urgent():
         urgent_count  = sum(1 for qa in history if qa.get("status") == "URGENT")
         monitor_count = sum(1 for qa in history if qa.get("status") == "MONITOR")
 
-        if urgent_count == 0 and monitor_count < 3:
-            print("[flag_urgent] skipping AI — not enough signal")
+        # If ANY urgent classification, always check with AI
+        if urgent_count == 0 and monitor_count == 0:
+            print("[flag_urgent] no concerning signals - skipping AI")
             return jsonify({"flagged_urgent": False})
 
         prompt = (
-            "You are a senior nurse reviewing a triage conversation.\n"
-            "Reply YES only if the patient needs immediate emergency attention.\n"
-            "Otherwise reply NO.\n\n"
+            "You are a senior triage nurse reviewing this patient conversation.\n\n"
+            "Does this patient need IMMEDIATE EMERGENCY care right now?\n\n"
+            "Say YES if:\n"
+            "- Severe chest pain or heart attack symptoms\n"
+            "- Can't breathe or severe breathing difficulty\n"
+            "- Unconscious or unresponsive\n"
+            "- Severe bleeding or trauma\n"
+            "- Stroke symptoms\n"
+            "- Intense/severe pain\n\n"
+            "Say NO for all other cases (even if they need monitoring).\n\n"
             f"Conversation:\n{history_text}\n\n"
-            "Reply ONLY YES or NO."
+            "Your decision (YES or NO):"
         )
 
         raw     = phi3(prompt, OLLAMA_OPTS_URGENT)

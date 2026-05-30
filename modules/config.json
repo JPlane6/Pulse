@@ -1,4 +1,6 @@
 {
   "room_number": "101",
-  "patient_name": "Robin"
+  "patient_name": "Robin",
+  "cached_alsa_device": "plughw:2,0",
+  "cached_pa_index": 0
 }
