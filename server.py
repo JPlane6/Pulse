@@ -22,8 +22,8 @@ SERVER_PORT = 5001
 
 OLLAMA_OPTS_FAST = {
     "temperature":    0.1,
-    "num_predict":    25,
-    "num_ctx":        512,
+    "num_predict":    20,
+    "num_ctx":        256,
     "repeat_penalty": 1.3,
     "top_k":          20,
     "top_p":          0.8,
@@ -33,7 +33,7 @@ OLLAMA_OPTS_FAST = {
 OLLAMA_OPTS_URGENT = {
     "temperature": 0.0,
     "num_predict": 3,
-    "num_ctx":     512,
+    "num_ctx":     256,
     "keep_alive":  "-1"
 }
 
@@ -42,7 +42,7 @@ OLLAMA_OPTS_URGENT = {
 # ═══════════════════════════════════════════════════════════════════
 
 print("[server] Loading Whisper model...")
-whisper_model = whisper.load_model("small")
+whisper_model = whisper.load_model("base")
 print("[server] Whisper ready.")
 
 # ═══════════════════════════════════════════════════════════════════
@@ -81,6 +81,10 @@ def extract_pain_score(text):
 
 
 def keyword_status(text):
+    """
+    Fast keyword check. Returns a status string if matched, or None if
+    the answer needs AI classification.
+    """
     if not text.strip():
         return "STABLE"
     lower = text.lower()
@@ -97,7 +101,7 @@ def keyword_status(text):
         if score >= 8: return "URGENT"
         if score >= 4: return "MONITOR"
         return "STABLE"
-    return None
+    return None  # needs AI
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -117,6 +121,9 @@ def transcribe_bytes(wav_bytes):
             condition_on_previous_text=False,
             no_speech_threshold=0.6,
             logprob_threshold=-1.0,
+            beam_size=3,
+            best_of=3,
+            temperature=0.0
         )
         text = result["text"].strip()
         print(f"[whisper] '{text}'")
@@ -137,7 +144,6 @@ FILLER_PREFIXES = [
     "Of course.", "Certainly.", "Understood.", "Noted.",
 ]
 
-# Any of these in the output means "no more questions"
 DONE_SIGNALS = [
     "done", "no further", "no more", "enough information",
     "no other information", "sufficient information", "that's all",
@@ -156,7 +162,7 @@ def clean_question(q):
         if q.lower().startswith(filler.lower()):
             q = q[len(filler):].strip()
 
-    # Catch leaked instructions / done signals
+    # Catch done signals
     q_lower = q.lower()
     for signal in DONE_SIGNALS:
         if signal in q_lower:
@@ -166,10 +172,8 @@ def clean_question(q):
     if "?" in q:
         q = q[:q.index("?") + 1].strip()
     else:
-        # No question mark — model didn't comply, treat as DONE
         return "DONE"
 
-    # Sanity guards
     if not q or len(q) > 120:
         return "DONE"
 
@@ -189,15 +193,18 @@ def phi3(prompt, opts):
         )
         print("[ollama status]", r.status_code)
         if not r.text.strip():
-            print("[ollama] empty response"); return "DONE"
+            print("[ollama] empty response")
+            return "DONE"
         print("[ollama raw]", r.text[:300])
         r.raise_for_status()
         try:
             parsed = r.json()
         except Exception:
-            print("[ollama] invalid JSON"); return "DONE"
+            print("[ollama] invalid JSON")
+            return "DONE"
         if "response" not in parsed:
-            print("[ollama] missing response field"); return "DONE"
+            print("[ollama] missing response field")
+            return "DONE"
         return parsed["response"].strip()
     except Exception as e:
         print(f"[ollama] Error: {repr(e)}")
@@ -206,8 +213,12 @@ def phi3(prompt, opts):
 
 
 def phi3_stream(prompt, opts):
-    """Yields tokens as they arrive from Ollama. Stops early on '?'."""
-    full = []
+    """
+    Yields tokens from Ollama as they arrive.
+    Stops as soon as a '?' is seen — we only want one question,
+    so there's no point streaming past it.
+    """
+    accumulated = []
     try:
         r = requests.post(
             OLLAMA_URL,
@@ -223,11 +234,9 @@ def phi3_stream(prompt, opts):
                 chunk = json.loads(line.decode("utf-8"))
                 token = chunk.get("response", "")
                 if token:
-                    full.append(token)
+                    accumulated.append(token)
                     yield token
-                    # Stop streaming as soon as we have a complete question
-                    joined = "".join(full)
-                    if "?" in joined:
+                    if "?" in "".join(accumulated):
                         break
                 if chunk.get("done", False):
                     break
@@ -240,54 +249,43 @@ def phi3_stream(prompt, opts):
 
 # ═══════════════════════════════════════════════════════════════════
 # PROMPTS
-#
-# KEY CHANGE: The question prompt NEVER mentions "DONE" at all.
-# Phi3 was reading "If all covered, output: DONE" and repeating it
-# verbatim as its answer. Now it only sees a simple instruction to
-# ask the next unanswered question. clean_question() handles the
-# case where there's no "?" in the output (returns DONE).
 # ═══════════════════════════════════════════════════════════════════
 
-
-
-def build_question_prompt(history_text, questions_asked=0, max_questions=6):
+def build_question_prompt(full_history_text, questions_asked):
+    """
+    full_history_text must already include the patient's latest answer.
+    questions_asked is the total number of turns completed so far.
+    """
     return (
         "You are a nurse robot doing a triage check-in.\n\n"
-        "Before you can stop, you MUST have collected ALL of the following from the patient:\n"
+        "You MUST collect ALL of the following before stopping:\n"
         "  [A] Pain score (a number 1-10)\n"
         "  [B] Location of the pain or discomfort\n"
         "  [C] How long the issue has been going on\n"
-        "  [D] Whether they have any difficulty breathing\n"
-        "  [E] Any current medications or known allergies\n\n"
-        "Look at the conversation below and check which of [A]-[E] are already answered.\n"
-        "If ANY of [A]-[E] are still missing AND you have asked fewer than "
-        f"{max_questions} questions total (you have asked {questions_asked} so far), "
+        "  [D] Whether they have difficulty breathing\n"
+        "  [E] Any medications or known allergies\n\n"
+        "Look at the conversation and find the FIRST item from [A]-[E] not yet answered.\n"
+        f"You have completed {questions_asked} questions so far (maximum 6).\n\n"
+        "If ANY of [A]-[E] are still missing AND questions_asked < 6, "
         "ask the single most important missing one.\n"
-        "If ALL of [A]-[E] are answered, OR the patient is clearly in severe distress "
-        "(chest pain, can't breathe, pain 9-10, unconscious), output exactly: DONE\n\n"
+        "If ALL of [A]-[E] are answered, OR the patient has a life-threatening emergency "
+        "(chest pain, can't breathe, pain 9-10), output exactly: DONE\n\n"
         "Rules:\n"
-        "- Output ONLY the question, nothing else. Under 12 words. Must end with ?.\n"
-        "- OR output exactly the word: DONE\n"
-        "- No explanations, no notes, no extra text.\n\n"
-        f"Conversation so far:\n{history_text}\n\n"
+        "- Output ONLY the question. Under 12 words. Must end with ?.\n"
+        "- OR output exactly: DONE\n"
+        "- No extra text, no explanations.\n\n"
+        f"Conversation:\n{full_history_text}\n\n"
         "Question:"
     )
 
 
-def build_assess_prompt(history_text, last_answer):
+def build_status_prompt(patient_answer):
     return (
-        "You are a clinical triage assistant for a nurse robot.\n\n"
-        f"Conversation so far:\n{history_text}\n\n"
-        f"Patient's latest answer: \"{last_answer}\"\n\n"
-        "Classify the latest answer:\n"
-        "  URGENT  = life-threatening: severe chest pain, cannot breathe, unconscious,\n"
-        "            uncontrolled bleeding, seizure, stroke, pain 9-10/10.\n"
-        "  MONITOR = moderate concern: pain 4-8/10, fever, dizziness, nausea,\n"
-        "            shortness of breath, confusion.\n"
-        "  STABLE  = mild or no symptoms: pain 1-3/10, feeling generally okay.\n"
-        "  When in doubt, choose the less severe option.\n\n"
-        "Reply with ONLY valid JSON, no markdown, no extra text:\n"
-        "{\"status\": \"URGENT|MONITOR|STABLE\", \"question\": \"your next question ending with ?\"}"
+        f"Patient said: '{patient_answer}'\n"
+        "Reply ONE word only: URGENT or MONITOR or STABLE\n"
+        "URGENT = chest pain, can't breathe, unconscious, pain 9-10\n"
+        "MONITOR = pain 4-8, fever, dizzy, nausea, shortness of breath\n"
+        "STABLE = mild or no symptoms, pain 1-3"
     )
 
 
@@ -300,91 +298,38 @@ def ping():
     return jsonify({"status": "ok"})
 
 
-@app.route("/turn", methods=["POST"])
-def turn():
-    """Non-streaming fallback endpoint."""
-    try:
-        body = request.get_json(force=True, silent=True) or {}
-        if not isinstance(body, dict):
-            return jsonify({"text": "", "status": "STABLE", "question": "DONE", "error": "invalid body"}), 400
-
-        audio_b64 = body.get("audio_b64", "")
-        history   = body.get("history", [])
-
-        if not audio_b64:
-            return jsonify({"text": "", "status": "STABLE", "question": "DONE", "error": "missing audio_b64"}), 400
-
-        try:
-            wav_bytes = base64.b64decode(audio_b64)
-        except Exception:
-            return jsonify({"text": "", "status": "STABLE", "question": "DONE", "error": "invalid base64"}), 400
-
-        text = transcribe_bytes(wav_bytes)
-        if not text:
-            return jsonify({"text": "", "status": "STABLE", "question": "DONE"})
-
-        history_text = "\n".join([
-            f"Nurse: {qa.get('q','')}\nPatient: {qa.get('a','')}" for qa in history
-        ])
-
-        fast_status = keyword_status(text)
-
-        if fast_status is not None:
-            question = clean_question(
-                phi3(build_question_prompt(history_text, questions_asked=len(history)), OLLAMA_OPTS_FAST).split("\n")[0]
-            )
-            print(f"[turn] fast={fast_status} q='{question}'")
-            return jsonify({"text": text, "status": fast_status, "question": question})
-
-        raw = phi3(build_assess_prompt(history_text, text), OLLAMA_OPTS_FAST)
-        raw = re.sub(r"```json|```", "", raw).strip()
-        print("[phi3 parsed raw]", raw)
-
-        try:
-            parsed   = json.loads(raw)
-            status   = parsed.get("status",   "STABLE").upper().strip()
-            question = parsed.get("question", "DONE").strip()
-        except Exception:
-            print("[phi3] JSON parse failed")
-            status   = "STABLE"
-            question = "DONE"
-
-        if status not in ["URGENT", "MONITOR", "STABLE"]:
-            status = "STABLE"
-
-        print(f"[turn] phi3={status} q='{question}'")
-        return jsonify({"text": text, "status": status, "question": clean_question(question)})
-
-    except Exception as e:
-        print(f"[turn] Error: {repr(e)}")
-        traceback.print_exc()
-        return jsonify({"text": "", "status": "STABLE", "question": "DONE", "error": str(e)}), 500
-
-
 @app.route("/turn_stream", methods=["POST"])
 def turn_stream():
     """
-    Streaming SSE endpoint.
-    Transcribes audio, classifies status, streams the next question
-    token-by-token so Piper can start speaking immediately.
-    Stops streaming as soon as a '?' is emitted to prevent bleed.
+    Main endpoint. Flow:
+      1. Transcribe audio (Whisper)
+      2. Keyword-check the answer for fast status
+      3. Stream the next question token-by-token (Pi starts speaking immediately)
+      4. After streaming, run AI status classification if keywords didn't match
+      5. Send done event with full result
+
+    The key insight: status classification runs AFTER we start streaming the
+    question, so the Pi's Piper TTS is already talking while the Mac figures
+    out the urgency level. By the time the question finishes playing, status
+    is ready. Zero extra wait.
     """
     try:
         body = request.get_json(force=True, silent=True) or {}
         if not isinstance(body, dict):
-            return jsonify({"text": "", "status": "STABLE", "question": "DONE", "error": "invalid body"}), 400
+            return jsonify({"error": "invalid body"}), 400
 
         audio_b64 = body.get("audio_b64", "")
         history   = body.get("history", [])
 
         if not audio_b64:
-            return jsonify({"text": "", "status": "STABLE", "question": "DONE", "error": "missing audio_b64"}), 400
+            return jsonify({"error": "missing audio_b64"}), 400
 
         try:
             wav_bytes = base64.b64decode(audio_b64)
         except Exception:
-            return jsonify({"text": "", "status": "STABLE", "question": "DONE", "error": "invalid base64"}), 400
+            return jsonify({"error": "invalid base64"}), 400
 
+        # Step 1: Transcribe
         text = transcribe_bytes(wav_bytes)
 
         if not text:
@@ -392,72 +337,63 @@ def turn_stream():
                 yield f"data: {json.dumps({'done': True, 'text': '', 'status': 'STABLE', 'question': 'DONE'})}\n\n"
             return Response(empty_gen(), mimetype="text/event-stream")
 
+        # Build full history including this answer, so the question prompt
+        # has complete context and won't re-ask anything already covered.
         history_text = "\n".join([
-            f"Nurse: {qa.get('q','')}\nPatient: {qa.get('a','')}" for qa in history
+            f"Nurse: {qa.get('q','')}\nPatient: {qa.get('a','')}"
+            for qa in history
         ])
+        # questions_asked = number of completed turns (history doesn't include current yet)
+        questions_asked = len(history) + 1
+        # full context includes the current answer
+        full_history = history_text + f"\nPatient: {text}" if history_text else f"Patient: {text}"
 
+        # Step 2: Fast keyword check
         fast_status = keyword_status(text)
 
         def generate_stream():
-            # ── Fast path (keyword matched) ────────────────────────
+            # Step 3: Stream the question immediately regardless of path.
+            # Both fast and AI paths do the same streaming — the only
+            # difference is where status comes from.
+            print(f"[turn_stream] streaming question (asked={questions_asked})...")
+            question_tokens = []
+            for token in phi3_stream(
+                build_question_prompt(full_history, questions_asked),
+                OLLAMA_OPTS_FAST
+            ):
+                question_tokens.append(token)
+                yield f"data: {json.dumps({'t': token})}\n\n"
+
+            question = clean_question("".join(question_tokens).split("\n")[0].strip())
+
+            # Step 4: Status — keyword match is instant, AI runs after streaming
             if fast_status is not None:
-                print(f"[turn_stream] fast path: {fast_status}")
-                question_tokens = []
-                for token in phi3_stream(build_question_prompt(history_text, questions_asked=len(history)), OLLAMA_OPTS_FAST):
-                    question_tokens.append(token)
-                    joined = "".join(question_tokens)
-                    # Only yield tokens up to and including the "?"
-                    if "?" in joined:
-                        # Yield everything up to the "?" then stop
-                        up_to_q = joined[:joined.index("?") + 1]
-                        # We've already been yielding token by token, so just send the final event
-                        yield f"data: {json.dumps({'t': token})}\n\n"
-                        break
-                    yield f"data: {json.dumps({'t': token})}\n\n"
-
-                question = clean_question("".join(question_tokens).split("\n")[0].strip())
-                yield f"data: {json.dumps({'done': True, 'text': text, 'status': fast_status, 'question': question})}\n\n"
-
-            # ── AI assessment path ─────────────────────────────────
+                status = fast_status
+                print(f"[turn_stream] keyword status={status}")
             else:
-                print("[turn_stream] AI path — classifying status...")
-                status_prompt = (
-                    "Triage nurse. Classify this patient response.\n\n"
-                    f"Patient: '{text}'\n\n"
-                    "Reply ONLY with one word: URGENT, MONITOR, or STABLE\n"
-                    "URGENT = severe chest pain, can't breathe, unconscious, pain 9-10\n"
-                    "MONITOR = moderate pain, dizziness, nausea, fever, pain 4-8\n"
-                    "STABLE = mild symptoms"
-                )
-                status_raw = phi3(status_prompt, OLLAMA_OPTS_URGENT)
-                status     = status_raw.upper().strip()
+                status_raw = phi3(build_status_prompt(text), OLLAMA_OPTS_URGENT)
+                status = status_raw.upper().strip()
                 if status not in ["URGENT", "MONITOR", "STABLE"]:
                     status = "STABLE"
+                print(f"[turn_stream] AI status={status}")
 
-                print(f"[turn_stream] classified as {status} — streaming question...")
-                question_tokens = []
-                full_history = history_text + f"\nPatient: {text}"
-                for token in phi3_stream(build_question_prompt(full_history, questions_asked=len(history)), OLLAMA_OPTS_FAST):
-                    question_tokens.append(token)
-                    yield f"data: {json.dumps({'t': token})}\n\n"
-                    # Stop as soon as we've collected a complete question
-                    if "?" in "".join(question_tokens):
-                        break
-
-                question = clean_question("".join(question_tokens).split("\n")[0].strip())
-                print(f"[turn_stream] done — status={status}, question='{question}'")
-                yield f"data: {json.dumps({'done': True, 'text': text, 'status': status, 'question': question})}\n\n"
+            print(f"[turn_stream] done — status={status} question='{question}'")
+            yield f"data: {json.dumps({'done': True, 'text': text, 'status': status, 'question': question})}\n\n"
 
         return Response(generate_stream(), mimetype="text/event-stream")
 
     except Exception as e:
         print(f"[turn_stream] Error: {repr(e)}")
         traceback.print_exc()
-        return jsonify({"text": "", "status": "STABLE", "question": "DONE", "error": str(e)}), 500
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/flag_urgent", methods=["POST"])
 def flag_urgent():
+    """
+    Final pass after all questions are done. Only calls AI if there's
+    enough signal — skips the call entirely for obviously stable sessions.
+    """
     try:
         body         = request.get_json(force=True, silent=True) or {}
         history      = body.get("history", [])
@@ -469,7 +405,7 @@ def flag_urgent():
         monitor_count = sum(1 for qa in history if qa.get("status") == "MONITOR")
 
         if urgent_count == 0 and monitor_count < 3:
-            print("[flag_urgent] skipping AI — not enough flags")
+            print("[flag_urgent] skipping AI — not enough signal")
             return jsonify({"flagged_urgent": False})
 
         prompt = (

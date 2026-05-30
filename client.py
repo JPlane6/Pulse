@@ -2,7 +2,6 @@ import sounddevice as sd
 import scipy.io.wavfile as wav
 import scipy.signal as signal
 import requests
-from requests.exceptions import Timeout, ConnectionError
 import tempfile
 import os
 import re
@@ -30,15 +29,16 @@ SAMPLERATE           = 16000
 AUDIO_DEVICE_KEYWORD = "USB"
 PIPER_MODEL          = "/home/ayushs0604/Pulse/en_US-hfc_female-medium.onnx"
 
-VAD_THRESHOLD        = 0.90
-VAD_SILENCE_DURATION = 1.5
-VAD_MAX_DURATION     = 15
+# VAD tuning — tighter silence so it returns faster after speech ends
+VAD_THRESHOLD        = 0.85          # slightly lower = more sensitive
+VAD_SILENCE_DURATION = 0.8           # was 1.2 — cuts dead air faster
+VAD_MAX_DURATION     = 12
 VAD_FRAME_SAMPLES    = 512
-RMS_GATE             = 150
+RMS_GATE             = 120           # was 150 — catches quieter speech
 
-# How many words to buffer before flushing a chunk to Piper.
-# Lowered to 2 so short questions don't get stuck waiting for more words.
-STREAM_CHUNK_WORDS   = 2
+# Urgency thresholds — need multiple signals before escalating
+URGENT_THRESHOLD     = 3             # answers classified URGENT before flagging
+MONITOR_THRESHOLD    = 2             # answers classified MONITOR before flagging
 
 LED_RED_PIN   = 17
 LED_GREEN_PIN = 27
@@ -51,14 +51,14 @@ CONFIG_PATH       = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mo
 os.makedirs(LOG_DIR, exist_ok=True)
 
 # ═══════════════════════════════════════════════════════════════════
-#  VAD — background load so it doesn't block the greeting
+#  VAD — loads in background so it doesn't block the greeting
 # ═══════════════════════════════════════════════════════════════════
 vad_model  = None
 _vad_ready = threading.Event()
 
 def _load_vad_bg():
     global vad_model
-    print("[vad] Loading Silero VAD in background...")
+    print("[vad] Loading Silero VAD...")
     from silero_vad import load_silero_vad
     vad_model = load_silero_vad()
     _vad_ready.set()
@@ -146,7 +146,7 @@ def init_audio_cache(alsa_dev, pa_index):
     g              = gcd(SAMPLERATE, _native_sr)
     _resample_up   = SAMPLERATE  // g
     _resample_down = _native_sr  // g
-    print(f"[audio] Native={_native_sr}Hz, resample {_native_sr}→{SAMPLERATE} ({_resample_up}/{_resample_down})")
+    print(f"[audio] Native={_native_sr}Hz  resample {_native_sr}→{SAMPLERATE}")
 
 
 def check_mic_present():
@@ -174,16 +174,19 @@ def load_config():
             return json.load(f)
     return {}
 
-def get_room_number(cfg): return str(cfg.get("room_number", "101")).strip()
-def get_patient_name(cfg):
-    return "".join(w.capitalize() for w in cfg.get("patient_name", "Patient").strip().split())
+def get_room_number(cfg):  return str(cfg.get("room_number", "101")).strip()
+def get_patient_name(cfg): return "".join(w.capitalize() for w in cfg.get("patient_name", "Patient").strip().split())
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  TTS ENGINE
+#  TTS
+#
+#  Both functions use a fresh Piper+aplay pair per call.
+#  aplay.wait() is a real OS signal — no sleep guessing.
+#  0.2s pause after is just a natural breath gap.
 # ═══════════════════════════════════════════════════════════════════
 
-def _open_piper_pipeline():
+def _open_pipeline():
     piper = subprocess.Popen(
         ["piper", "--model", PIPER_MODEL, "--output_raw"],
         stdin=subprocess.PIPE,
@@ -204,22 +207,17 @@ def _close_pipeline(piper, aplay):
         piper.stdin.close()
     except Exception:
         pass
-    try:
-        aplay.wait(timeout=10)
-    except Exception:
-        pass
-    try:
-        piper.wait(timeout=3)
-    except Exception:
-        pass
+    aplay.wait()    # blocks until audio is fully played — guaranteed done
+    piper.wait()
+    time.sleep(0.2) # short breath pause before mic opens
 
 
 def speak_plain(text):
-    """Blocking TTS for fixed phrases."""
+    """Blocking TTS. Does not return until audio is fully played."""
     if not text.strip():
         return
     print(f"[tts] '{text}'")
-    piper, aplay = _open_piper_pipeline()
+    piper, aplay = _open_pipeline()
     try:
         piper.stdin.write((text.strip() + "\n").encode("utf-8"))
     except BrokenPipeError:
@@ -229,41 +227,36 @@ def speak_plain(text):
 
 def speak_stream(sse_response):
     """
-    Consumes SSE token stream from /turn_stream, drives Piper in real time.
+    Streams SSE tokens from /turn_stream into Piper as they arrive.
+    Flushes to Piper only on sentence-ending punctuation so Piper gets
+    full sentence context for natural prosody — no word-by-word feeding.
+    Waits for aplay to drain before returning.
 
-    FIX 1: buf is flushed immediately when a '?' is seen — this ensures
-            the last word of a short question is never left hanging.
-    FIX 2: After the SSE loop exits, any remaining buf is always flushed
-            before _close_pipeline is called.
-    FIX 3: Tokens that contain DONE signals are dropped silently so
-            leaked prompt text never reaches Piper.
-
-    Returns (transcribed_text, status, full_question).
+    Returns (transcribed_text, status, next_question).
+    The next_question is NOT spoken here — caller decides what to do with it.
     """
     text     = ""
     status   = "STABLE"
     question = "DONE"
 
-    # Signals from the server prompt that must never be spoken
     MUTE_SIGNALS = [
         "done", "if all", "all covered", "topics covered",
-        "output done", "output: done", "no further", "no more"
+        "output done", "output: done", "no further", "no more",
+        "question:", "rules:", "conversation:", "nurse:", "patient:"
     ]
 
-    piper, aplay = _open_piper_pipeline()
+    piper, aplay = _open_pipeline()
     buf = ""
 
     def _flush(chunk):
         chunk = chunk.strip()
         if not chunk:
             return
-        # Drop any chunk that looks like a leaked instruction
-        chunk_lower = chunk.lower()
         for sig in MUTE_SIGNALS:
-            if sig in chunk_lower:
-                print(f"[tts-stream] MUTED leaked chunk: '{chunk}'")
+            if sig in chunk.lower():
+                print(f"[tts-stream] muted: '{chunk}'")
                 return
-        print(f"[tts-stream] speaking: '{chunk}'")
+        print(f"[tts-stream] → '{chunk}'")
         try:
             piper.stdin.write((chunk + " ").encode("utf-8"))
             piper.stdin.flush()
@@ -282,7 +275,6 @@ def speak_stream(sse_response):
             except Exception:
                 continue
 
-            # ── Final event — read metadata, stop streaming ────────
             if evt.get("done"):
                 text     = evt.get("text",     "")
                 status   = evt.get("status",   "STABLE")
@@ -295,21 +287,14 @@ def speak_stream(sse_response):
 
             buf += token
 
-            # Flush immediately on sentence-ending punctuation
+            # Only flush on sentence boundaries — Piper needs context
             if buf.rstrip()[-1:] in ".?!":
-                _flush(buf)
-                buf = ""
-                continue
-
-            # Flush when we have enough words buffered
-            if token.endswith(" ") and len(buf.split()) >= STREAM_CHUNK_WORDS:
                 _flush(buf)
                 buf = ""
 
     except Exception as e:
-        print(f"[tts-stream] Stream error: {e}")
+        print(f"[tts-stream] error: {e}")
 
-    # ── FIX: always flush whatever is left in buf ──────────────────
     if buf.strip():
         _flush(buf)
 
@@ -317,22 +302,55 @@ def speak_stream(sse_response):
     return text, status, question
 
 
+def consume_stream_silent(sse_response):
+    """Drains SSE stream without speaking. Returns (text, status, question)."""
+    text     = ""
+    status   = "STABLE"
+    question = "DONE"
+    try:
+        for raw_line in sse_response.iter_lines():
+            if not raw_line:
+                continue
+            line = raw_line.decode("utf-8") if isinstance(raw_line, bytes) else raw_line
+            if not line.startswith("data: "):
+                continue
+            try:
+                evt = json.loads(line[6:])
+            except Exception:
+                continue
+            if evt.get("done"):
+                text     = evt.get("text",     "")
+                status   = evt.get("status",   "STABLE")
+                question = evt.get("question", "DONE")
+                break
+    except Exception as e:
+        print(f"[stream] error: {e}")
+    return text, status, question
+
+
 # ═══════════════════════════════════════════════════════════════════
 #  RECORD
+#
+#  Starts listening immediately after TTS finishes (aplay.wait() means
+#  we're already done speaking). 300ms settling eats any room reverb.
+#  Returns as soon as 0.8s of silence detected — much snappier than 1.2s.
 # ═══════════════════════════════════════════════════════════════════
 
 def record(silence_duration=VAD_SILENCE_DURATION, max_duration=VAD_MAX_DURATION):
     if not _vad_ready.is_set():
-        print("[mic] Waiting for VAD to finish loading...")
+        print("[mic] Waiting for VAD...")
         _vad_ready.wait()
 
     hw_blocksize        = int(VAD_FRAME_SAMPLES * (_native_sr / SAMPLERATE))
     silence_frames_need = int(silence_duration * _native_sr / hw_blocksize)
     max_frames          = int(max_duration * _native_sr / hw_blocksize)
+    # 300ms settling — eats room reverb from TTS, but starts fast
+    settling_frames     = int(0.3 * _native_sr / hw_blocksize)
 
     frames           = []
     silent_frames    = 0
     started_speaking = False
+    frame_count      = 0
 
     print("[mic] Listening...")
 
@@ -342,6 +360,15 @@ def record(silence_duration=VAD_SILENCE_DURATION, max_duration=VAD_MAX_DURATION)
             for _ in range(max_frames):
                 raw, _  = stream.read(hw_blocksize)
                 frame   = raw.flatten()
+                frame_count += 1
+
+                # Discard settling frames without appending
+                if frame_count <= settling_frames:
+                    continue
+
+                if frame_count == settling_frames + 1:
+                    print("[mic] Ready.")
+
                 frames.append(frame.copy())
 
                 rms = np.sqrt(np.mean(frame.astype(np.float32) ** 2))
@@ -363,7 +390,7 @@ def record(silence_duration=VAD_SILENCE_DURATION, max_duration=VAD_MAX_DURATION)
                 elif started_speaking:
                     silent_frames += 1
                     if silent_frames >= silence_frames_need:
-                        print("[mic] End of speech detected.")
+                        print("[mic] End of speech.")
                         break
 
     except Exception as e:
@@ -391,13 +418,15 @@ def record(silence_duration=VAD_SILENCE_DURATION, max_duration=VAD_MAX_DURATION)
 #  SERVER CALLS
 # ═══════════════════════════════════════════════════════════════════
 
+_http_session = requests.Session()
+
 def turn_stream(audio_bytes, history):
     try:
         payload = {
             "audio_b64": base64.b64encode(audio_bytes).decode(),
             "history":   history
         }
-        r = requests.post(
+        r = _http_session.post(
             f"{SERVER_URL}/turn_stream",
             json=payload,
             stream=True,
@@ -405,16 +434,39 @@ def turn_stream(audio_bytes, history):
         )
         return r
     except Exception as e:
-        print(f"[turn_stream] Connection error: {e}")
+        print(f"[turn_stream] error: {e}")
         return None
 
 
 def check_urgent(history):
     try:
-        r = requests.post(f"{SERVER_URL}/flag_urgent", json={"history": history}, timeout=60)
+        r = _http_session.post(
+            f"{SERVER_URL}/flag_urgent",
+            json={"history": history},
+            timeout=60
+        )
         return r.json()["flagged_urgent"]
     except Exception:
         return False
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  TRIAGE STATUS LOGIC
+#
+#  Single answer never escalates status alone.
+#  Need URGENT_THRESHOLD (3) urgent answers OR MONITOR_THRESHOLD (2)
+#  monitor answers before the session status climbs.
+#  Short-circuit exits only when AI says DONE (all info collected).
+# ═══════════════════════════════════════════════════════════════════
+
+def compute_session_status(history):
+    urgent_count  = sum(1 for qa in history if qa.get("status") == "URGENT")
+    monitor_count = sum(1 for qa in history if qa.get("status") == "MONITOR")
+    if urgent_count >= URGENT_THRESHOLD:
+        return "URGENT"
+    if monitor_count >= MONITOR_THRESHOLD:
+        return "MONITOR"
+    return "STABLE"
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -475,34 +527,41 @@ def save_log(session_dir, record_data):
 
 # ═══════════════════════════════════════════════════════════════════
 #  STATUS ANNOUNCEMENT
-#  Spoken at the very end of every session, before the robot moves on.
 # ═══════════════════════════════════════════════════════════════════
 
 STATUS_PHRASES = {
     "URGENT":  "Your condition has been marked as urgent. A nurse is being alerted right now.",
     "MONITOR": "Your condition has been marked as monitor. A nurse will check on you shortly.",
-    "STABLE":  "Your condition has been marked as stable. I'll be back in a bit, but call if you need anything.",
+    "STABLE":  "Your condition has been marked as stable. I'll check back later, but call if you need anything.",
 }
 
 def announce_status(patient_name, status, flagged):
-    """Speak the triage result out loud."""
-    if flagged or status == "URGENT":
-        phrase = STATUS_PHRASES["URGENT"]
-    elif status == "MONITOR":
-        phrase = STATUS_PHRASES["MONITOR"]
-    else:
-        phrase = STATUS_PHRASES["STABLE"]
-
+    phrase = STATUS_PHRASES["URGENT" if (flagged or status == "URGENT") else status]
     speak_plain(f"{patient_name}, {phrase}")
     speak_plain("Feel better soon.")
 
 
 # ═══════════════════════════════════════════════════════════════════
 #  MAIN
+#
+#  Q1: speak greeting → record → turn_stream → speak_stream speaks
+#      the AI's first follow-up question live. next_q comes back from
+#      speak_stream but is NOT spoken yet.
+#
+#  Q2-Q6: speak_plain(next_q) immediately (no server wait) → record
+#      → turn_stream → consume_stream_silent (silent, just get next_q)
+#
+#  This means: patient hears each question the moment the previous
+#  answer is processed, with no extra gap.
+#
+#  Exit conditions:
+#    - AI returns DONE (all info collected — clean exit)
+#    - MAX_QUESTIONS reached
+#    - Server unreachable
 # ═══════════════════════════════════════════════════════════════════
 
 def main():
-    # ── Hardware discovery ──────────────────────────────────────────
+    # ── Hardware discovery ─────────────────────────────────────────
     alsa_device = find_alsa_device()
     if alsa_device is None:
         print("[main] FATAL: No ALSA output found.")
@@ -511,7 +570,8 @@ def main():
     _alsa_device = alsa_device
 
     lcd = init_lcd()
-    if lcd: lcd.write_string("PULSE BOOTING...")
+    if lcd:
+        lcd.write_string("PULSE BOOTING...")
 
     if not check_mic_present():
         show_error_on_lcd(lcd, "MIC NOT FOUND", "Check Hardware")
@@ -527,7 +587,7 @@ def main():
     init_audio_cache(alsa_device, pa_input_index)
 
     if not check_server():
-        show_error_on_lcd(lcd, "SERVER OFFLINE", "Check Laptop Host")
+        show_error_on_lcd(lcd, "SERVER OFFLINE", "Check Laptop")
         speak_plain("I cannot connect to my brain server.")
         return
 
@@ -539,80 +599,79 @@ def main():
     session_dir  = os.path.join(LOG_DIR, f"{date.replace('/','-')}_{time_str}_Room{room}_{patient_name}")
 
     if lcd:
-        lcd.clear(); lcd.write_string("PULSE READY")
+        lcd.clear()
+        lcd.write_string("PULSE READY")
 
     set_status_led("STABLE")
 
-    priority = {"STABLE": 0, "MONITOR": 1, "URGENT": 2}
-    history  = []
-    status   = "STABLE"
+    history = []
+    status  = "STABLE"
 
-    # ── First question ──────────────────────────────────────────────
+    # ── Q1 ─────────────────────────────────────────────────────────
+    # VAD loads during speak_plain — by the time we hit record() it's ready.
     first_q = f"Hello {patient_name}! I am Pulse. What's bothering you today?"
     speak_plain(first_q)
 
     audio = record()
-
-    sse = turn_stream(audio, [])
+    sse   = turn_stream(audio, [])
     if sse is None:
-        print("[main] Server unreachable on first turn.")
+        print("[main] Server unreachable on Q1.")
         return
 
+    # speak_stream speaks the AI follow-up live as tokens stream in.
+    # next_q is the question that was spoken — we'll use it as the label
+    # for Q2 in history, but we do NOT speak it again.
     answer, answer_status, next_q = speak_stream(sse)
-    history.append({"q": first_q, "a": answer, "status": answer_status})
-    if priority[answer_status] > priority[status]:
-        status = answer_status
-    set_status_led(status)
-    print(f"[status] {status}")
 
-    # ── Follow-up loop ──────────────────────────────────────────────
+    print(f"[transcription] '{answer}'")
+    history.append({"q": first_q, "a": answer, "status": answer_status})
+    status = compute_session_status(history)
+    set_status_led(status)
+    print(f"[status] {status}  (urgent={sum(1 for q in history if q['status']=='URGENT')} monitor={sum(1 for q in history if q['status']=='MONITOR')})")
+
+    # ── Q2-Q6 ──────────────────────────────────────────────────────
     for i in range(MAX_QUESTIONS - 1):
         if not next_q or next_q.strip().upper() == "DONE":
-            print("[main] AI signalled DONE.")
+            print("[main] AI signalled DONE — all info collected.")
             break
 
-        print(f"\n--- Q{i+2} of {MAX_QUESTIONS}: '{next_q}' ---")
+        print(f"\n--- Q{i+2}/{MAX_QUESTIONS}: '{next_q}' ---")
+
+        # Speak the question we already have — fires immediately
+        speak_plain(next_q)
 
         audio = record()
-
-        sse = turn_stream(audio, history)
+        sse   = turn_stream(audio, history)
         if sse is None:
             print("[main] Server unreachable — ending session.")
             break
 
         prev_q = next_q
-        answer, answer_status, next_q = speak_stream(sse)
+        # Silent drain — get transcription, status, next question
+        answer, answer_status, next_q = consume_stream_silent(sse)
 
+        print(f"[transcription] '{answer}'")
         history.append({"q": prev_q, "a": answer, "status": answer_status})
-        if priority[answer_status] > priority[status]:
-            status = answer_status
+        status = compute_session_status(history)
         set_status_led(status)
-        print(f"[status] {status}")
+        print(f"[status] {status}  (urgent={sum(1 for q in history if q['status']=='URGENT')} monitor={sum(1 for q in history if q['status']=='MONITOR')})")
 
-        urgent_streak = sum(1 for qa in history[-2:] if qa.get("status") == "URGENT")
-        if urgent_streak >= 2:
-            print("[main] Two consecutive URGENT — ending early.")
-            break
-
-    # ── Final decision ──────────────────────────────────────────────
+    # ── Final decision ─────────────────────────────────────────────
     print("\n--- Finalizing ---")
     flagged = check_urgent(history)
-
     if flagged:
         status = "URGENT"
 
     set_status_led(status)
-
-    # ── Announce the result out loud ────────────────────────────────
     announce_status(patient_name, status, flagged)
-
     show_status_on_lcd(lcd, status, flagged)
+
     save_log(session_dir, {
         "header":     {"patient_name": patient_name, "room": room, "date": date, "time": time_str},
         "triage":     {"final_status": status, "flagged_urgent": flagged},
         "assessment": history
     })
-    print(f"[main] Session complete. Status={status} Flagged={flagged}")
+    print(f"[main] Done. Status={status} Flagged={flagged}")
 
 
 if __name__ == "__main__":
