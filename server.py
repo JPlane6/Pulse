@@ -47,8 +47,8 @@ OLLAMA_OPTS_URGENT = {
     "top_p": 0.1,
     "top_k": 1,
     "repeat_penalty": 1.0,
-    "num_predict": 2,
-    "num_ctx": 512,
+    "num_predict": 3,           # one word (URGENT/MONITOR/STABLE) + wiggle room
+    "num_ctx": 2048,            # must match OLLAMA_OPTS_FAST — prevents model runner reload between calls
     "keep_alive": "-1",
     "stop": ["\n", "Patient:", "Nurse:"]
 }
