@@ -14,7 +14,7 @@ def hello():
         lcd.write_string("BY THE")
         lcd.cursor_pos = (3, 0)
         lcd.write_string("BRAINY BADGERS!")
-        time.sleep(5)
+        time.sleep(3)
         lcd.clear()
 
     except Exception as e:
