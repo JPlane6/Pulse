@@ -24,7 +24,7 @@ torch.set_num_interop_threads(1)
 #  CONFIG
 # ═══════════════════════════════════════════════════════════════════
 SERVER_URL           = "http://192.168.0.157:5001"
-MAX_QUESTIONS        = 6
+MAX_QUESTIONS        = 6  # Matches server MAX_QUESTIONS
 SAMPLERATE           = 16000
 AUDIO_DEVICE_KEYWORD = "USB"
 PIPER_MODEL          = "/home/ayushs0604/Pulse/en_US-hfc_female-medium.onnx"
@@ -533,7 +533,7 @@ def save_log(session_dir, record_data):
 STATUS_PHRASES = {
     "URGENT":  "Its urgent, I'm calling a nurse right now. Help is on the way.",
     "MONITOR": "No worries, A nurse will monitor you soon.",
-    "STABLE":  "Have a great day. Call if you need anything.",
+    "STABLE":  "You have been marked as STABLE. Have a great day. Call if you need anything.",
 }
 
 def announce_status(patient_name, status, flagged):
